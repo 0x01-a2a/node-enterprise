@@ -20,7 +20,9 @@ ExecStart=/opt/zerox1/bin/zerox1-node \
   --api-addr 0.0.0.0:8081 \
   --hosting \
   --hosting-fee-bps 0 \
-  --public-api-url https://us1.0x01.world
+  --public-api-url https://us1.0x01.world \
+  --relay-server \
+  --node-region us-east
 
 # Environment file holds secrets (not checked into git).
 # Create /etc/zerox1/env with:
