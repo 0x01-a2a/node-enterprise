@@ -1692,6 +1692,14 @@ impl Zx01Node {
             tracing::warn!("BEACON publish failed: {e}");
         } else {
             tracing::debug!("BEACON sent (nonce={})", self.nonce);
+            // Gossipsub does not loop published messages back to the publisher,
+            // so we push our own BEACON directly to the aggregator here.
+            self.push_to_aggregator(serde_json::json!({
+                "msg_type": "BEACON",
+                "sender":   hex::encode(self.identity.agent_id),
+                "name":     self.config.agent_name,
+                "slot":     self.current_slot,
+            }));
         }
     }
 
