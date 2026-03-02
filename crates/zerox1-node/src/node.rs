@@ -9,8 +9,8 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer, VerifyingKey};
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent,
-    PeerId, Swarm,
+    autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
+    swarm::SwarmEvent, PeerId, Swarm,
 };
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use zerox1_sati_client::client::SatiClient;
@@ -122,6 +122,10 @@ pub struct Zx01Node {
     /// Broadcasts queued when gossipsub had no mesh peers (InsufficientPeers).
     /// Flushed the moment any peer subscribes to our topic.
     pending_broadcasts: Vec<Envelope>,
+    /// Throttle map for latency reports: last time we pushed a LATENCY event
+    /// for each peer. Prevents flooding the aggregator with per-ping pushes.
+    /// Only populated when --node-region is set.
+    last_ping_push: HashMap<PeerId, std::time::Instant>,
 }
 
 impl Zx01Node {
@@ -192,6 +196,7 @@ impl Zx01Node {
             notary_pool: HashMap::new(),
             bootstrap_peers,
             pending_broadcasts: Vec::new(),
+            last_ping_push: HashMap::new(),
         }
     }
 
@@ -272,6 +277,21 @@ impl Zx01Node {
         // ── Startup lease check ───────────────────────────────────────────────
         // Verify our own agent's lease before joining the mesh.
         self.check_own_lease().await?;
+
+        // ── Geo self-registration ─────────────────────────────────────────────
+        if let Some(ref country) = self.config.geo_country {
+            self.push_to_aggregator(serde_json::json!({
+                "msg_type":     "ADVERTISE",
+                "sender":       hex::encode(self.identity.agent_id),
+                "capabilities": [],
+                "slot":         self.current_slot,
+                "geo": {
+                    "country": country,
+                    "city":    self.config.geo_city.clone(),
+                }
+            }));
+            tracing::info!("Geo registered: country={country}");
+        }
 
         // ── FCM registration (phone-as-node) ─────────────────────────────────
         // If a Firebase device token is configured, register it with the
@@ -659,6 +679,7 @@ impl Zx01Node {
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 tracing::debug!("Disconnected from {peer_id}");
+                self.last_ping_push.remove(&peer_id);
             }
             SwarmEvent::Behaviour(behaviour_event) => {
                 self.handle_behaviour_event(swarm, behaviour_event).await;
@@ -814,6 +835,36 @@ impl Zx01Node {
                 tracing::info!("AutoNAT status: {old:?} → {new:?}");
             }
             Zx01BehaviourEvent::Autonat(_) => {}
+
+            // ── Ping — RTT measurement for geo plausibility ───────────────────
+            // Only report when --node-region is configured (genesis/reference nodes).
+            Zx01BehaviourEvent::Ping(ping::Event { peer, result, .. }) => {
+                if let (Ok(rtt), Some(ref region)) = (result, self.config.node_region.clone()) {
+                    if let Some(agent_id) = self.peer_states.agent_id_for_peer(&peer) {
+                        let now = std::time::Instant::now();
+                        let should_push = self
+                            .last_ping_push
+                            .get(&peer)
+                            .map(|t| now.duration_since(*t).as_secs() >= 60)
+                            .unwrap_or(true);
+                        if should_push {
+                            let rtt_ms = rtt.as_millis() as u64;
+                            self.push_to_aggregator(serde_json::json!({
+                                "msg_type": "LATENCY",
+                                "agent_id": hex::encode(agent_id),
+                                "region":   region,
+                                "rtt_ms":   rtt_ms,
+                                "slot":     self.current_slot,
+                            }));
+                            self.last_ping_push.insert(peer, now);
+                            tracing::debug!(
+                                "Latency: agent={} region={region} rtt={rtt_ms}ms",
+                                hex::encode(agent_id),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -967,20 +1018,29 @@ impl Zx01Node {
                     // Parse capabilities JSON: {"capabilities": ["translation", "price-feed"]}
                     if let Ok(text) = std::str::from_utf8(&env.payload) {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-                            if let Some(arr) = val.get("capabilities").and_then(|v| v.as_array()) {
-                                let caps: Vec<String> = arr
-                                    .iter()
-                                    .filter_map(|c| c.as_str().map(|s| s.to_string()))
-                                    .take(32)
-                                    .collect();
-                                if !caps.is_empty() {
-                                    self.push_to_aggregator(serde_json::json!({
-                                        "msg_type":     "ADVERTISE",
-                                        "sender":       hex::encode(env.sender),
-                                        "capabilities": caps,
-                                        "slot":         self.current_slot,
-                                    }));
+                            let caps: Vec<String> = val
+                                .get("capabilities")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                                        .take(32)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let has_geo = val.get("geo").is_some();
+                            // Forward whenever there are caps OR geo — they are independent.
+                            if !caps.is_empty() || has_geo {
+                                let mut push = serde_json::json!({
+                                    "msg_type":     "ADVERTISE",
+                                    "sender":       hex::encode(env.sender),
+                                    "capabilities": caps,
+                                    "slot":         self.current_slot,
+                                });
+                                if let Some(geo) = val.get("geo") {
+                                    push["geo"] = geo.clone();
                                 }
+                                self.push_to_aggregator(push);
                             }
                         }
                     }

@@ -40,29 +40,29 @@ mod tests {
         }
 
         // Test case 1: Basic pagination (limit 10, offset 0)
-        let page1 = store.list_agents(10, 0, "id");
+        let page1 = store.list_agents(10, 0, "id", None);
         assert_eq!(page1.len(), 10);
         assert_eq!(page1[0].agent_id, "agent-00");
         assert_eq!(page1[9].agent_id, "agent-09");
 
         // Test case 2: Second page (limit 10, offset 10)
-        let page2 = store.list_agents(10, 10, "id");
+        let page2 = store.list_agents(10, 10, "id", None);
         assert_eq!(page2.len(), 10);
         assert_eq!(page2[0].agent_id, "agent-10");
         assert_eq!(page2[9].agent_id, "agent-19");
 
         // Test case 3: Partial last page (limit 10, offset 20) -> should get 5 items
-        let page3 = store.list_agents(10, 20, "id");
+        let page3 = store.list_agents(10, 20, "id", None);
         assert_eq!(page3.len(), 5);
         assert_eq!(page3[0].agent_id, "agent-20");
         assert_eq!(page3[4].agent_id, "agent-24");
 
         // Test case 4: Offset beyond range
-        let page4 = store.list_agents(10, 50, "id");
+        let page4 = store.list_agents(10, 50, "id", None);
         assert!(page4.is_empty());
 
         // Test case 5: Limit larger than total
-        let page5 = store.list_agents(100, 0, "id");
+        let page5 = store.list_agents(100, 0, "id", None);
         assert_eq!(page5.len(), 25);
     }
 }
@@ -117,11 +117,30 @@ pub struct NotarizeBidEvent {
     pub slot: u64,
 }
 
+/// Latency measurement pushed by a reference node (--node-region).
+/// agent_id is the measured peer; region identifies the reference point.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyEvent {
+    pub agent_id: String,
+    pub region: String,
+    pub rtt_ms: u64,
+    pub slot: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoInfo {
+    pub country: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdvertiseEvent {
     pub sender: String,
     pub capabilities: Vec<String>,
     pub slot: u64,
+    #[serde(default)]
+    pub geo: Option<GeoInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +247,8 @@ pub enum IngestEvent {
     Dispute(DisputeEvent),
     #[serde(rename = "BEACON")]
     Beacon(BeaconEvent),
+    #[serde(rename = "LATENCY")]
+    Latency(LatencyEvent),
 }
 
 // ============================================================================
@@ -253,10 +274,102 @@ pub struct AgentReputation {
     /// Human-readable name from the last BEACON, empty string if unknown.
     #[serde(default)]
     pub name: String,
+    /// ISO 3166-1 alpha-2 country code (self-reported via ADVERTISE geo field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    /// City name (self-reported via ADVERTISE geo field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    /// Measured RTT in ms from each reference node: region → rtt_ms.
+    /// Populated by genesis nodes running with --node-region.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub latency: std::collections::HashMap<String, u64>,
+    /// Whether the measured latency profile is consistent with the claimed
+    /// geo country. None = not enough data; true/false = verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geo_consistent: Option<bool>,
 }
 
 fn default_trend() -> String {
     "stable".to_string()
+}
+
+/// Check whether a measured latency profile is plausible for a claimed country.
+///
+/// Returns `Some(true)` if consistent, `Some(false)` if implausible, `None` if
+/// there is not enough data to make a determination.
+///
+/// Uses generous upper-bound RTT thresholds so honest agents are not falsely
+/// flagged. The check mainly catches agents that claim one continent but have
+/// sub-50ms RTT to a reference node on another continent.
+fn compute_geo_consistent(
+    country: &str,
+    latency: &std::collections::HashMap<String, u64>,
+) -> Option<bool> {
+    if latency.is_empty() {
+        return None;
+    }
+    // (max_rtt_from_us_east_ms, max_rtt_from_eu_west_ms)
+    // None means "no bound for this reference point" (e.g. country is on same
+    // side of the world as one reference but far from the other).
+    let (us_max, eu_max): (u64, u64) = match country.to_uppercase().as_str() {
+        // North America
+        "US" | "CA" | "MX" => (80, 220),
+        // Caribbean / Central America
+        "CU" | "DO" | "HT" | "JM" | "TT" | "BB" | "CR" | "PA" | "GT" | "HN" | "SV" | "NI"
+        | "BZ" => (140, 260),
+        // South America
+        "BR" | "AR" | "CL" | "CO" | "PE" | "VE" | "EC" | "BO" | "PY" | "UY" | "GY" | "SR"
+        | "GF" => (220, 300),
+        // Western Europe
+        "DE" | "FR" | "GB" | "NL" | "BE" | "CH" | "AT" | "SE" | "NO" | "DK" | "FI" | "IE"
+        | "PT" | "ES" | "IT" | "LU" | "IS" => (200, 60),
+        // Eastern / Southern Europe
+        "PL" | "CZ" | "SK" | "HU" | "RO" | "BG" | "HR" | "RS" | "SI" | "GR" | "EE" | "LV"
+        | "LT" | "UA" | "BY" | "MD" | "CY" | "AL" | "MK" | "BA" | "ME" | "XK" => (220, 100),
+        // North Africa + Middle East
+        "EG" | "MA" | "DZ" | "TN" | "LY" | "AE" | "SA" | "QA" | "KW" | "BH" | "OM" | "IQ"
+        | "IR" | "IL" | "JO" | "LB" | "SY" | "TR" => (260, 180),
+        // Sub-Saharan Africa
+        "NG" | "GH" | "KE" | "ZA" | "ET" | "TZ" | "UG" | "RW" | "SN" | "CI" | "CM" | "CD"
+        | "AO" | "MZ" | "ZM" | "ZW" | "BW" | "NA" | "MG" | "MU" | "TG" | "BJ" | "ML"
+        | "BF" | "NE" | "TD" | "SO" | "ER" | "SS" => (300, 220),
+        // South Asia
+        "IN" | "PK" | "BD" | "LK" | "NP" | "AF" | "MV" => (360, 300),
+        // Southeast Asia
+        "SG" | "MY" | "TH" | "PH" | "ID" | "VN" | "MM" | "KH" | "LA" | "BN" | "TL" => {
+            (380, 340)
+        }
+        // East Asia
+        "JP" | "KR" | "CN" | "TW" | "HK" | "MO" | "MN" => (340, 360),
+        // Central Asia
+        "KZ" | "UZ" | "TM" | "KG" | "TJ" => (280, 220),
+        // Oceania
+        "AU" | "NZ" | "FJ" | "PG" | "SB" | "VU" | "WS" | "TO" => (380, 420),
+        _ => return None,
+    };
+
+    // Only produce a verdict when at least one known reference point has data.
+    // If the latency map holds only future/unknown regions, return None rather
+    // than a spurious Some(true).
+    let us_rtt = latency.get("us-east").copied();
+    let eu_rtt = latency.get("eu-west").copied();
+    if us_rtt.is_none() && eu_rtt.is_none() {
+        return None;
+    }
+
+    let mut consistent = true;
+    if let Some(rtt) = us_rtt {
+        if rtt > us_max {
+            consistent = false;
+        }
+    }
+    if let Some(rtt) = eu_rtt {
+        if rtt > eu_max {
+            consistent = false;
+        }
+    }
+    Some(consistent)
 }
 
 impl AgentReputation {
@@ -274,6 +387,10 @@ impl AgentReputation {
             trend: default_trend(),
             last_seen: now_secs(),
             name: String::new(),
+            country: None,
+            city: None,
+            latency: std::collections::HashMap::new(),
+            geo_consistent: None,
         }
     }
 
@@ -732,6 +849,27 @@ CREATE TABLE IF NOT EXISTS ownership_claims (
     claimed_at INTEGER NOT NULL
 );
 ",
+    // v6: Agent geo metadata (self-reported, upserted on ADVERTISE)
+    "
+CREATE TABLE IF NOT EXISTS agent_geo (
+    agent_id   TEXT    NOT NULL PRIMARY KEY,
+    country    TEXT    NOT NULL,
+    city       TEXT,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_geo_country ON agent_geo(country);
+",
+    // v7: Latency measurements from reference nodes (--node-region)
+    "
+CREATE TABLE IF NOT EXISTS agent_latency (
+    agent_id   TEXT    NOT NULL,
+    region     TEXT    NOT NULL,
+    rtt_ms     INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, region)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_latency_agent ON agent_latency(agent_id);
+",
 ];
 
 struct Db(rusqlite::Connection);
@@ -809,6 +947,10 @@ impl Db {
                 trend: default_trend(),
                 last_seen: last_updated, // Default to last_updated if loaded from DB where BEACON wasn't active
                 name: String::new(),
+                country: None,
+                city: None,
+                latency: std::collections::HashMap::new(),
+                geo_consistent: None,
             })
         })?;
 
@@ -859,6 +1001,91 @@ impl Db {
                  last_seen    = excluded.last_seen,
                  beacon_count = beacon_count + 1",
             rusqlite::params![ev.sender, ev.name, ts as i64, ts as i64,],
+        )?;
+        Ok(())
+    }
+
+    /// Load all geo rows into a HashMap (agent_id → (country, city)).
+    fn load_geo(&self) -> rusqlite::Result<HashMap<String, (String, Option<String>)>> {
+        let mut stmt = self
+            .0
+            .prepare("SELECT agent_id, country, city FROM agent_geo")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (agent_id, country, city) = row?;
+            map.insert(agent_id, (country, city));
+        }
+        Ok(map)
+    }
+
+    /// Load all latency rows: agent_id → HashMap<region, rtt_ms>.
+    fn load_latency(
+        &self,
+    ) -> rusqlite::Result<std::collections::HashMap<String, std::collections::HashMap<String, u64>>>
+    {
+        let mut stmt = self
+            .0
+            .prepare("SELECT agent_id, region, rtt_ms FROM agent_latency")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        })?;
+        let mut map: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, u64>,
+        > = std::collections::HashMap::new();
+        for row in rows {
+            let (agent_id, region, rtt_ms) = row?;
+            map.entry(agent_id).or_default().insert(region, rtt_ms);
+        }
+        Ok(map)
+    }
+
+    /// Upsert a latency measurement for one agent from one reference region.
+    fn upsert_latency(
+        &self,
+        agent_id: &str,
+        region: &str,
+        rtt_ms: u64,
+        now: u64,
+    ) -> rusqlite::Result<()> {
+        self.0.execute(
+            "INSERT INTO agent_latency (agent_id, region, rtt_ms, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id, region) DO UPDATE SET
+               rtt_ms     = excluded.rtt_ms,
+               updated_at = excluded.updated_at",
+            rusqlite::params![agent_id, region, rtt_ms as i64, now as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Upsert agent geo metadata.
+    fn upsert_geo(
+        &self,
+        agent_id: &str,
+        country: &str,
+        city: Option<&str>,
+        now: u64,
+    ) -> rusqlite::Result<()> {
+        self.0.execute(
+            "INSERT INTO agent_geo (agent_id, country, city, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(agent_id) DO UPDATE SET
+               country    = excluded.country,
+               city       = excluded.city,
+               updated_at = excluded.updated_at",
+            rusqlite::params![agent_id, country, city, now as i64],
         )?;
         Ok(())
     }
@@ -1712,6 +1939,28 @@ impl ReputationStore {
             }
         }
 
+        // Populate geo from DB.
+        if let Ok(geo_map) = db.load_geo() {
+            for (agent_id, (country, city)) in geo_map {
+                if let Some(rep) = agents.get_mut(&agent_id) {
+                    rep.country = Some(country);
+                    rep.city = city;
+                }
+            }
+        }
+
+        // Populate latency from DB and recompute geo_consistent.
+        if let Ok(latency_map) = db.load_latency() {
+            for (agent_id, regions) in latency_map {
+                if let Some(rep) = agents.get_mut(&agent_id) {
+                    rep.latency = regions;
+                    if let Some(ref country) = rep.country.clone() {
+                        rep.geo_consistent = compute_geo_consistent(country, &rep.latency);
+                    }
+                }
+            }
+        }
+
         tracing::info!(
             "Loaded {} reputation records from {}",
             agents.len(),
@@ -2093,12 +2342,54 @@ impl ReputationStore {
                     .cloned()
                     .collect();
                 tracing::debug!("ADVERTISE agent={} caps={:?}", &ad.sender[..8], caps);
+                // Validate geo before taking any lock.
+                // country: 2–8 ASCII alpha chars (ISO 3166-1 alpha-2 = 2; allow sub-codes).
+                // city:    1–64 chars, alphanumeric + space + hyphen + apostrophe.
+                let validated_geo: Option<(String, Option<String>)> =
+                    ad.geo.as_ref().and_then(|geo| {
+                        let country = geo.country.trim();
+                        let country_ok = country.len() >= 2
+                            && country.len() <= 8
+                            && country.chars().all(|ch| ch.is_ascii_alphabetic());
+                        if !country_ok {
+                            return None;
+                        }
+                        let city = geo
+                            .city
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| {
+                                !s.is_empty()
+                                    && s.len() <= 64
+                                    && s.chars().all(|ch| {
+                                        ch.is_alphanumeric()
+                                            || ch == ' '
+                                            || ch == '-'
+                                            || ch == '\''
+                                    })
+                            })
+                            .map(str::to_string);
+                        Some((country.to_string(), city))
+                    });
                 let db = self.db.lock().unwrap();
                 if let Some(ref conn) = *db {
                     for cap in &caps {
                         if let Err(e) = conn.upsert_capability(&ad.sender, cap, ts) {
                             tracing::warn!("SQLite upsert_capability failed: {e}");
                         }
+                    }
+                    if let Some((ref country, ref city)) = validated_geo {
+                        conn.upsert_geo(&ad.sender, country, city.as_deref(), ts)
+                            .unwrap_or_else(|e| tracing::warn!("upsert_geo failed: {e}"));
+                    }
+                }
+                drop(db);
+                // Update in-memory geo if present and valid.
+                if let Some((country, city)) = validated_geo {
+                    let mut inner = self.inner.write().unwrap();
+                    if let Some(rep) = inner.agents.get_mut(&ad.sender) {
+                        rep.country = Some(country);
+                        rep.city = city;
                     }
                 }
                 None
@@ -2207,6 +2498,53 @@ impl ReputationStore {
                 }
                 None
             }
+            IngestEvent::Latency(lev) => {
+                if !is_valid_agent_id(&lev.agent_id) {
+                    tracing::warn!(
+                        "Ingest: invalid agent_id in LATENCY '{}' — dropped",
+                        &lev.agent_id
+                    );
+                    return None;
+                }
+                // Sanity-check region: max 32 chars, alphanumeric + hyphen.
+                let region = lev.region.trim();
+                if region.is_empty()
+                    || region.len() > 32
+                    || !region
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+                {
+                    tracing::warn!("Ingest: invalid region in LATENCY '{}' — dropped", region);
+                    return None;
+                }
+                // Cap RTT at 10 000 ms — anything higher is noise / timeout.
+                let rtt_ms = lev.rtt_ms.min(10_000);
+                let ts = now_secs();
+                drop(inner);
+
+                // Persist to DB.
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    if let Err(e) = conn.upsert_latency(&lev.agent_id, region, rtt_ms, ts) {
+                        tracing::warn!("upsert_latency failed: {e}");
+                    }
+                }
+                drop(db);
+
+                // Update in-memory latency and recompute geo_consistent.
+                let mut inner = self.inner.write().unwrap();
+                if let Some(rep) = inner.agents.get_mut(&lev.agent_id) {
+                    rep.latency.insert(region.to_string(), rtt_ms);
+                    if let Some(ref country) = rep.country.clone() {
+                        rep.geo_consistent = compute_geo_consistent(country, &rep.latency);
+                    }
+                }
+                tracing::debug!(
+                    "LATENCY agent={} region={region} rtt={rtt_ms}ms",
+                    &lev.agent_id[..8],
+                );
+                None
+            }
         }
     }
 
@@ -2234,9 +2572,23 @@ impl ReputationStore {
         agents
     }
 
-    pub fn list_agents(&self, limit: usize, offset: usize, sort_by: &str) -> Vec<AgentReputation> {
+    pub fn list_agents(
+        &self,
+        limit: usize,
+        offset: usize,
+        sort_by: &str,
+        country_filter: Option<&str>,
+    ) -> Vec<AgentReputation> {
         let inner = self.inner.read().unwrap();
         let mut agents: Vec<&AgentReputation> = inner.agents.values().collect();
+        if let Some(country) = country_filter {
+            agents.retain(|a| {
+                a.country
+                    .as_deref()
+                    .map(|c| c.eq_ignore_ascii_case(country))
+                    .unwrap_or(false)
+            });
+        }
         if sort_by == "recent" || sort_by == "active" {
             agents.sort_by(|a, b| {
                 b.last_seen

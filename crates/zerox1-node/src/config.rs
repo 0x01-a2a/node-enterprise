@@ -137,6 +137,22 @@ pub struct Config {
     /// Example: "https://host.example.com:9091"
     #[arg(long, env = "ZX01_PUBLIC_API_URL")]
     pub public_api_url: Option<String>,
+
+    /// Geographic region identifier for this node, used as a latency reference point.
+    /// When set, the node measures RTT to every connected peer and reports it to the
+    /// aggregator so agents' geo claims can be cross-checked.
+    /// Intended for always-on infrastructure nodes (bootstrap / genesis fleet).
+    /// Suggested values: "us-east", "eu-west". Set ZX01_NODE_REGION on genesis nodes.
+    #[arg(long, env = "ZX01_NODE_REGION")]
+    pub node_region: Option<String>,
+
+    /// ISO 3166-1 alpha-2 country code advertised to the mesh (e.g. NG, DE, US).
+    #[arg(long, env = "ZX01_GEO_COUNTRY")]
+    pub geo_country: Option<String>,
+
+    /// City name for geo-tagging (e.g. Lagos). Optional companion to geo_country.
+    #[arg(long, env = "ZX01_GEO_CITY")]
+    pub geo_city: Option<String>,
 }
 
 impl Config {

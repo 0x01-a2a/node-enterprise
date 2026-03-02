@@ -180,6 +180,8 @@ pub struct AgentsParams {
     offset: usize,
     #[serde(default = "default_sort")]
     sort: String,
+    /// Optional ISO 3166-1 alpha-2 country filter (e.g. ?country=NG).
+    country: Option<String>,
 }
 
 fn default_offset() -> usize {
@@ -194,7 +196,9 @@ pub async fn get_agents(
     Query(params): Query<AgentsParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.min(200);
-    let agents = state.store.list_agents(limit, params.offset, &params.sort);
+    let agents = state
+        .store
+        .list_agents(limit, params.offset, &params.sort, params.country.as_deref());
     Json(agents)
 }
 

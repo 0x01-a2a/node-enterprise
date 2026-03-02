@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, noise, relay, request_response,
+    autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay, request_response,
     swarm::NetworkBehaviour, tcp, yamux, StreamProtocol,
 };
 use std::io;
@@ -35,6 +35,10 @@ pub struct Zx01Behaviour {
     /// AutoNAT — probes external reachability; helps classify the node as
     /// publicly reachable, behind NAT, or unknown.
     pub autonat: autonat::Behaviour,
+    /// Ping — measures round-trip latency to each connected peer.
+    /// Used by reference nodes (--node-region) to report latency to the
+    /// aggregator for geo plausibility checks.
+    pub ping: ping::Behaviour,
 }
 
 // ============================================================================
@@ -192,6 +196,7 @@ pub fn build_swarm(
 
             let dcutr = dcutr::Behaviour::new(peer_id);
             let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
+            let ping = ping::Behaviour::new(ping::Config::new());
 
             Ok(Zx01Behaviour {
                 gossipsub,
@@ -203,6 +208,7 @@ pub fn build_swarm(
                 relay_client,
                 dcutr,
                 autonat,
+                ping,
             })
         })?
         .build();

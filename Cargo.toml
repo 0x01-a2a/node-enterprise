@@ -50,6 +50,7 @@ libp2p = { version = "0.54", features = [
     "relay",
     "dcutr",
     "request-response",
+    "ping",
     "macros",
 ] }
 
