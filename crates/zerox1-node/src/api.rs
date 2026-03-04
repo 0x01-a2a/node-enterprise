@@ -615,7 +615,7 @@ async fn send_envelope(
     Json(req): Json<SendEnvelopeRequest>,
 ) -> impl IntoResponse {
     // Authenticate: only the master secret (not read-only keys) can send envelopes.
-    if let Some(_) = require_api_secret_or_unauthorized(&state, &headers) {
+    if require_api_secret_or_unauthorized(&state, &headers).is_some() {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),
