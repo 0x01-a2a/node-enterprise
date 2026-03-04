@@ -45,6 +45,51 @@ pub struct AppState {
     pub blob_dir: Option<PathBuf>,
     /// 8004 Agent Registry client for on-chain identity checks.
     pub registry: Registry8004Client,
+    /// API keys for gating read endpoints.
+    /// Empty = public access (dev mode). When non-empty, all read endpoints
+    /// require `Authorization: Bearer <key>` matching one of these values.
+    pub api_keys: Vec<String>,
+}
+
+/// Check if the request carries a valid API key.
+/// Returns None (pass) if api_keys is empty (dev mode) or the token matches.
+/// Returns Some(401) if api_keys is configured but the token is missing/invalid.
+pub fn require_api_key(state: &AppState, headers: &HeaderMap) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if state.api_keys.is_empty() {
+        return None; // No keys configured — public access (dev mode)
+    }
+
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    for key in &state.api_keys {
+        if ct_eq(provided, key.as_str()) {
+            return None; // Valid key
+        }
+    }
+
+    Some((
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": "unauthorized — provide a valid API key via Authorization: Bearer <key>" })),
+    ))
+}
+
+/// Axum middleware that gates requests behind `AGGREGATOR_API_KEYS`.
+/// Applied via `route_layer(middleware::from_fn_with_state(...))` on the
+/// gated route group.
+pub async fn api_key_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some((status, body)) = require_api_key(&state, &headers) {
+        return (status, body).into_response();
+    }
+    next.run(request).await
 }
 
 // ============================================================================

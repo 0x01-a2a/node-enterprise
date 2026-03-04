@@ -125,20 +125,37 @@ pub async fn lock_stake_onchain(
     if let Some(kora) = kora {
         let fee_payer = kora.get_fee_payer().await?;
 
-        let ix = build_lock_stake_ix(
-            &fee_payer,
-            &agent_pubkey,
-            &owner_ata,
-            &stake_account,
-            &vault_auth,
-            &vault_ata,
-            &agent_mint,
-            &owner_sati_ata,
-            &usdc,
-            &program_id,
-            identity.agent_id,
-            MIN_STAKE_USDC,
-        );
+        let is_8004 = identity.agent_id == identity.verifying_key.to_bytes();
+
+        let ix = if is_8004 {
+            build_lock_stake_ix_8004(
+                &fee_payer,
+                &agent_pubkey,
+                &owner_ata,
+                &stake_account,
+                &vault_auth,
+                &vault_ata,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+                MIN_STAKE_USDC,
+            )
+        } else {
+            build_lock_stake_ix(
+                &fee_payer,
+                &agent_pubkey,
+                &owner_ata,
+                &stake_account,
+                &vault_auth,
+                &vault_ata,
+                &agent_mint,
+                &owner_sati_ata,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+                MIN_STAKE_USDC,
+            )
+        };
 
         let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &recent_blockhash);
         let mut tx = Transaction {
@@ -155,20 +172,37 @@ pub async fn lock_stake_onchain(
 
         tracing::info!(agent = %hex::encode(identity.agent_id), "Stake locked via Kora (gasless)");
     } else {
-        let ix = build_lock_stake_ix(
-            &agent_pubkey,
-            &agent_pubkey,
-            &owner_ata,
-            &stake_account,
-            &vault_auth,
-            &vault_ata,
-            &agent_mint,
-            &owner_sati_ata,
-            &usdc,
-            &program_id,
-            identity.agent_id,
-            MIN_STAKE_USDC,
-        );
+        let is_8004 = identity.agent_id == identity.verifying_key.to_bytes();
+
+        let ix = if is_8004 {
+            build_lock_stake_ix_8004(
+                &agent_pubkey,
+                &agent_pubkey,
+                &owner_ata,
+                &stake_account,
+                &vault_auth,
+                &vault_ata,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+                MIN_STAKE_USDC,
+            )
+        } else {
+            build_lock_stake_ix(
+                &agent_pubkey,
+                &agent_pubkey,
+                &owner_ata,
+                &stake_account,
+                &vault_auth,
+                &vault_ata,
+                &agent_mint,
+                &owner_sati_ata,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+                MIN_STAKE_USDC,
+            )
+        };
 
         let tx = Transaction::new_signed_with_payer(
             &[ix],
@@ -269,6 +303,42 @@ fn build_lock_stake_ix(
             AccountMeta::new_readonly(*agent_mint, false),
             AccountMeta::new_readonly(*owner_sati_token, false),
             AccountMeta::new_readonly(token_2022_program(), false), // sati_token_program (Token-2022)
+            AccountMeta::new_readonly(*usdc_mint, false),
+            AccountMeta::new_readonly(spl_token_program(), false),
+            AccountMeta::new_readonly(associated_token_program(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+        data,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_lock_stake_ix_8004(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    owner_usdc: &Pubkey,
+    stake_account: &Pubkey,
+    stake_vault_auth: &Pubkey,
+    stake_vault: &Pubkey,
+    usdc_mint: &Pubkey,
+    program_id: &Pubkey,
+    agent_id: [u8; 32],
+    amount: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(48);
+    data.extend_from_slice(&anchor_discriminator("lock_stake_8004"));
+    data.extend_from_slice(&agent_id); // LockStakeArgs { agent_mint }
+    data.extend_from_slice(&amount.to_le_bytes()); // LockStakeArgs { amount }
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(*owner, true),
+            AccountMeta::new(*owner_usdc, false),
+            AccountMeta::new(*stake_account, false),
+            AccountMeta::new_readonly(*stake_vault_auth, false),
+            AccountMeta::new(*stake_vault, false),
             AccountMeta::new_readonly(*usdc_mint, false),
             AccountMeta::new_readonly(spl_token_program(), false),
             AccountMeta::new_readonly(associated_token_program(), false),

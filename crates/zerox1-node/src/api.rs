@@ -243,6 +243,9 @@ struct ApiInner {
     inbox_tx: broadcast::Sender<InboundEnvelope>,
     /// Optional bearer token to authenticate mutating API endpoints.
     api_secret: Option<String>,
+    /// Read-only bearer tokens — grants access to GET/WS visualization endpoints
+    /// but NOT to mutating endpoints like /envelopes/send.
+    api_read_keys: Vec<String>,
 
     // Hosted-agent state
     /// token (hex-32) → HostedSession
@@ -253,6 +256,8 @@ struct ApiInner {
     hosted_outbound_tx: mpsc::Sender<Envelope>,
     /// Global rate limit window for `/envelopes/send`.
     send_rate_limit: Mutex<RateLimitWindow>,
+    /// Global rate limit window for `/hosted/register`.
+    hosted_register_rate_limit: Mutex<RateLimitWindow>,
     /// Global rate limit window for `/registry/8004/register-prepare`.
     registry_prepare_rate_limit: Mutex<RateLimitWindow>,
 
@@ -265,6 +270,8 @@ struct ApiInner {
     is_mainnet: bool,
     /// Optional override for the 8004 base collection (required on mainnet).
     registry_8004_collection: Option<String>,
+    /// The current Solana slot, continuously updated by the node event loop.
+    current_slot: core::sync::atomic::AtomicU64,
 }
 
 /// Cheaply cloneable shared state passed to all axum handlers.
@@ -280,6 +287,7 @@ impl ApiState {
         self_agent: [u8; 32],
         self_name: String,
         api_secret: Option<String>,
+        api_read_keys: Vec<String>,
         hosting_fee_bps: u32,
         rpc_url: String,
         http_client: reqwest::Client,
@@ -305,10 +313,15 @@ impl ApiState {
             outbound_tx,
             inbox_tx,
             api_secret,
+            api_read_keys,
             hosted_sessions: Arc::new(RwLock::new(HashMap::new())),
             hosting_fee_bps,
             hosted_outbound_tx,
             send_rate_limit: Mutex::new(RateLimitWindow {
+                window_start: now_secs(),
+                count: 0,
+            }),
+            hosted_register_rate_limit: Mutex::new(RateLimitWindow {
                 window_start: now_secs(),
                 count: 0,
             }),
@@ -320,6 +333,7 @@ impl ApiState {
             http_client,
             is_mainnet,
             registry_8004_collection,
+            current_slot: core::sync::atomic::AtomicU64::new(0),
         }));
 
         (state, outbound_rx, hosted_outbound_rx)
@@ -346,6 +360,14 @@ impl ApiState {
     /// Broadcast a visualization event to all /ws/events subscribers.
     pub fn send_event(&self, event: ApiEvent) {
         let _ = self.0.event_tx.send(event);
+    }
+
+    pub fn set_current_slot(&self, slot: u64) {
+        self.0.current_slot.store(slot, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn get_current_slot(&self) -> u64 {
+        self.0.current_slot.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     // ── Agent integration helpers ─────────────────────────────────────────────
@@ -479,17 +501,8 @@ async fn ws_events_handler(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<ApiState>,
 ) -> impl IntoResponse {
-    if let Some(ref secret) = state.0.api_secret {
-        let provided = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| params.get("token").map(|s| s.as_str()))
-            .unwrap_or("");
-
-        if !ct_eq(provided, secret.as_str()) {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    if let Some(resp) = require_read_or_master_ws(&state, &headers, &params) {
+        return resp;
     }
     ws.on_upgrade(|socket| ws_events_task(socket, state))
 }
@@ -513,7 +526,7 @@ async fn ws_events_task(mut socket: WebSocket, state: ApiState) {
 }
 
 async fn get_identity(headers: HeaderMap, State(state): State<ApiState>) -> Response {
-    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
         return resp;
     }
     Json(serde_json::json!({
@@ -524,7 +537,7 @@ async fn get_identity(headers: HeaderMap, State(state): State<ApiState>) -> Resp
 }
 
 async fn get_peers(headers: HeaderMap, State(state): State<ApiState>) -> Response {
-    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
         return resp;
     }
     let peers = state.0.peers.read().await;
@@ -537,7 +550,7 @@ async fn get_reputation(
     headers: HeaderMap,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
         return resp;
     }
     let Ok(bytes) = hex::decode(&agent_id_hex) else {
@@ -560,7 +573,7 @@ async fn get_batch(
     headers: HeaderMap,
     State(state): State<ApiState>,
 ) -> Response {
-    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
         return resp;
     }
     let self_hex = hex::encode(state.0.self_agent);
@@ -744,17 +757,8 @@ async fn ws_inbox_handler(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<ApiState>,
 ) -> impl IntoResponse {
-    if let Some(ref secret) = state.0.api_secret {
-        let provided = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| params.get("token").map(|s| s.as_str()))
-            .unwrap_or("");
-
-        if !ct_eq(provided, secret.as_str()) {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    if let Some(resp) = require_read_or_master_ws(&state, &headers, &params) {
+        return resp;
     }
     ws.on_upgrade(|socket| ws_inbox_task(socket, state))
 }
@@ -798,6 +802,24 @@ async fn hosted_register(State(state): State<ApiState>) -> impl IntoResponse {
         );
     }
     let now = now_secs();
+
+    // Global rate limit for unauthenticated registration to prevent memory/RPC DoS
+    {
+        let mut rl = state.0.hosted_register_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
+        // Allow up to 60 registrations per minute globally (1 per second average).
+        // This accommodates normal web/mobile app usage while preventing massive DoS bursts.
+        if rl.count >= 60 {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "registration rate limit exceeded" })),
+            );
+        }
+        rl.count += 1;
+    }
 
     let mut sessions = state.0.hosted_sessions.write().await;
 
@@ -980,7 +1002,7 @@ async fn hosted_send(
             msg_type,
             session.agent_id,
             recipient,
-            0,
+            state.get_current_slot(),
             session.nonce,
             conversation_id,
             payload,
@@ -1146,6 +1168,80 @@ fn require_api_secret_or_unauthorized(state: &ApiState, headers: &HeaderMap) -> 
         }
     }
     None
+}
+
+/// Like `require_api_secret_or_unauthorized` but ALSO accepts any read-only key
+/// from `--api-read-keys`. Used for GET/WS visualization endpoints that the
+/// explorer team needs without granting write access.
+fn require_read_or_master_access(state: &ApiState, headers: &HeaderMap) -> Option<Response> {
+    // If no master secret is configured, all endpoints are open (dev mode).
+    let has_master = state.0.api_secret.is_some();
+    let has_read_keys = !state.0.api_read_keys.is_empty();
+    if !has_master && !has_read_keys {
+        return None;
+    }
+
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    // Check master key first.
+    if let Some(ref secret) = state.0.api_secret {
+        if ct_eq(provided, secret.as_str()) {
+            return None; // master key — full access
+        }
+    }
+
+    // Check read-only keys.
+    for key in &state.0.api_read_keys {
+        if ct_eq(provided, key.as_str()) {
+            return None; // valid read key
+        }
+    }
+
+    Some(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response(),
+    )
+}
+
+/// WS variant: extract token from `Authorization` header OR `?token=` query param,
+/// then check read-only OR master key.
+fn require_read_or_master_ws(
+    state: &ApiState,
+    headers: &HeaderMap,
+    params: &HashMap<String, String>,
+) -> Option<Response> {
+    let has_master = state.0.api_secret.is_some();
+    let has_read_keys = !state.0.api_read_keys.is_empty();
+    if !has_master && !has_read_keys {
+        return None;
+    }
+
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .or_else(|| params.get("token").map(|s| s.as_str()))
+        .unwrap_or("");
+
+    if let Some(ref secret) = state.0.api_secret {
+        if ct_eq(provided, secret.as_str()) {
+            return None;
+        }
+    }
+    for key in &state.0.api_read_keys {
+        if ct_eq(provided, key.as_str()) {
+            return None;
+        }
+    }
+
+    Some(StatusCode::UNAUTHORIZED.into_response())
 }
 
 /// Extract the Bearer token from an `Authorization: Bearer <token>` header.

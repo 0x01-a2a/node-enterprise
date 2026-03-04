@@ -189,19 +189,35 @@ pub async fn init_lease_onchain(
     if let Some(kora) = kora {
         let fee_payer = kora.get_fee_payer().await?;
 
-        let ix = build_init_lease_ix(
-            &fee_payer,
-            &agent_pubkey,
-            &owner_ata,
-            &agent_mint,
-            &owner_sati_ata,
-            &lease_pda,
-            &treasury_ata,
-            &treasury,
-            &usdc,
-            &program_id,
-            identity.agent_id,
-        );
+        let is_8004 = identity.agent_id == identity.verifying_key.to_bytes();
+
+        let ix = if is_8004 {
+            build_init_lease_ix_8004(
+                &fee_payer,
+                &agent_pubkey,
+                &owner_ata,
+                &lease_pda,
+                &treasury_ata,
+                &treasury,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+            )
+        } else {
+            build_init_lease_ix(
+                &fee_payer,
+                &agent_pubkey,
+                &owner_ata,
+                &agent_mint,
+                &owner_sati_ata,
+                &lease_pda,
+                &treasury_ata,
+                &treasury,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+            )
+        };
 
         let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &recent_blockhash);
         let mut tx = Transaction {
@@ -218,19 +234,35 @@ pub async fn init_lease_onchain(
 
         tracing::info!(agent = %hex::encode(identity.agent_id), "Lease initialized via Kora (gasless)");
     } else {
-        let ix = build_init_lease_ix(
-            &agent_pubkey,
-            &agent_pubkey,
-            &owner_ata,
-            &agent_mint,
-            &owner_sati_ata,
-            &lease_pda,
-            &treasury_ata,
-            &treasury,
-            &usdc,
-            &program_id,
-            identity.agent_id,
-        );
+        let is_8004 = identity.agent_id == identity.verifying_key.to_bytes();
+
+        let ix = if is_8004 {
+            build_init_lease_ix_8004(
+                &agent_pubkey,
+                &agent_pubkey,
+                &owner_ata,
+                &lease_pda,
+                &treasury_ata,
+                &treasury,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+            )
+        } else {
+            build_init_lease_ix(
+                &agent_pubkey,
+                &agent_pubkey,
+                &owner_ata,
+                &agent_mint,
+                &owner_sati_ata,
+                &lease_pda,
+                &treasury_ata,
+                &treasury,
+                &usdc,
+                &program_id,
+                identity.agent_id,
+            )
+        };
 
         let tx = Transaction::new_signed_with_payer(
             &[ix],
@@ -393,6 +425,46 @@ fn build_init_lease_ix(
             AccountMeta::new(*treasury_usdc, false),
             AccountMeta::new_readonly(*treasury, false),
             AccountMeta::new_readonly(token_2022_program(), false), // sati_token_program (Token-2022)
+            AccountMeta::new_readonly(*usdc_mint, false),
+            AccountMeta::new_readonly(spl_token_program(), false),
+            AccountMeta::new_readonly(associated_token_program(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+        data,
+    }
+}
+
+/// Build the `init_lease_8004` instruction (SATI-free variant for 8004 agents).
+///
+/// Identical to `build_init_lease_ix` but omits:
+///   - agent_mint (no SATI NFT)
+///   - owner_sati_token (no SATI token account)
+///   - sati_token_program (Token-2022 not needed)
+#[allow(clippy::too_many_arguments)]
+fn build_init_lease_ix_8004(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    owner_usdc: &Pubkey,
+    lease_account: &Pubkey,
+    treasury_usdc: &Pubkey,
+    treasury: &Pubkey,
+    usdc_mint: &Pubkey,
+    program_id: &Pubkey,
+    agent_id: [u8; 32],
+) -> Instruction {
+    let mut data = Vec::with_capacity(40);
+    data.extend_from_slice(&anchor_discriminator("init_lease_8004"));
+    data.extend_from_slice(&agent_id); // InitLeaseArgs { agent_id }
+
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(*owner, true),
+            AccountMeta::new(*owner_usdc, false),
+            AccountMeta::new(*lease_account, false),
+            AccountMeta::new(*treasury_usdc, false),
+            AccountMeta::new_readonly(*treasury, false),
             AccountMeta::new_readonly(*usdc_mint, false),
             AccountMeta::new_readonly(spl_token_program(), false),
             AccountMeta::new_readonly(associated_token_program(), false),

@@ -85,6 +85,50 @@ pub mod lease {
         Ok(())
     }
 
+    /// Initialize a lease account for an 8004 registered agent.
+    /// Does not require a SATI NFT. The agent (owner) signs directly.
+    pub fn init_lease_8004(ctx: Context<InitLease8004>, args: InitLeaseArgs) -> Result<()> {
+        let lease = &mut ctx.accounts.lease_account;
+        let clock = Clock::get()?;
+
+        let current_epoch = clock.unix_timestamp as u64 / EPOCH_LENGTH_SECS;
+
+        lease.version = 1;
+        lease.agent_id = args.agent_id;
+        
+        // 8004 agents use their own pubkey bytes as their agent_id.
+        require!(
+            args.agent_id == ctx.accounts.owner.key().to_bytes(),
+            LeaseError::MintMismatch
+        );
+
+        lease.owner = ctx.accounts.owner.key();
+        lease.paid_through_epoch = current_epoch + 1;
+        lease.last_paid_slot = clock.slot;
+        lease.current_epoch = current_epoch;
+        lease.in_grace_period = false;
+        lease.deactivated = false;
+        lease.bump = ctx.bumps.lease_account;
+
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.owner_usdc.to_account_info(),
+                to: ctx.accounts.treasury_usdc.to_account_info(),
+                authority: ctx.accounts.owner.to_account_info(),
+            },
+        );
+        token::transfer(cpi_ctx, LEASE_COST_PER_EPOCH_USDC)?;
+
+        emit!(LeaseInitialized {
+            agent_id: args.agent_id,
+            owner: ctx.accounts.owner.key(),
+            slot: clock.slot,
+        });
+
+        Ok(())
+    }
+
     /// Pay lease for N epochs in advance.
     ///
     /// Transfers LEASE_COST_PER_EPOCH_USDC × n_epochs from owner's USDC ATA
@@ -233,6 +277,49 @@ pub struct InitLease<'info> {
 
     /// Token program for SATI NFTs (Token-2022).
     pub sati_token_program: Interface<'info, TokenInterface>,
+    #[account(address = USDC_MINT)]
+    pub usdc_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(args: InitLeaseArgs)]
+pub struct InitLease8004<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = owner,
+    )]
+    pub owner_usdc: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = LeaseAccount::SIZE,
+        seeds = [b"lease", args.agent_id.as_ref()],
+        bump
+    )]
+    pub lease_account: Account<'info, LeaseAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint      = usdc_mint,
+        associated_token::authority = treasury,
+    )]
+    pub treasury_usdc: Account<'info, TokenAccount>,
+
+    /// CHECK: verified via associated_token constraint on treasury_usdc.
+    #[account(address = TREASURY_PUBKEY)]
+    pub treasury: UncheckedAccount<'info>,
+
     #[account(address = USDC_MINT)]
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,

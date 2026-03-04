@@ -101,6 +101,51 @@ pub mod stake_lock {
         Ok(())
     }
 
+    /// Lock MIN_STAKE_USDC for an 8004 registered agent.
+    /// Does not require a SATI NFT. The agent (owner) signs directly.
+    pub fn lock_stake_8004(ctx: Context<LockStake8004>, args: LockStakeArgs) -> Result<()> {
+        let stake = &mut ctx.accounts.stake_account;
+        let clock = Clock::get()?;
+
+        require!(
+            args.amount >= MIN_STAKE_USDC,
+            StakeLockError::InsufficientStake
+        );
+        require!(
+            args.agent_mint == ctx.accounts.owner.key().to_bytes(),
+            StakeLockError::MintMismatch
+        );
+
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.owner_usdc.to_account_info(),
+                to: ctx.accounts.stake_vault.to_account_info(),
+                authority: ctx.accounts.owner.to_account_info(),
+            },
+        );
+        token::transfer(cpi_ctx, args.amount)?;
+
+        stake.version = 1;
+        stake.agent_mint = args.agent_mint;
+        stake.owner = ctx.accounts.owner.key();
+        stake.stake_usdc = args.amount;
+        stake.locked_since_slot = clock.slot;
+        stake.in_unlock_queue = false;
+        stake.unlock_available_slot = 0;
+        stake.bump = ctx.bumps.stake_account;
+        stake.vault_authority_bump = ctx.bumps.stake_vault_authority;
+
+        emit!(StakeLocked {
+            agent_mint: args.agent_mint,
+            owner: ctx.accounts.owner.key(),
+            usdc: args.amount,
+            slot: clock.slot,
+        });
+
+        Ok(())
+    }
+
     /// Queue stake for unlock. Only callable when the agent's lease has expired.
     ///
     /// Sets unlock_available_slot = current_slot + UNLOCK_DELAY_SLOTS.
@@ -449,6 +494,53 @@ pub struct LockStake<'info> {
 
     /// Token program for SATI NFTs (Token-2022).
     pub sati_token_program: Interface<'info, TokenInterface>,
+    #[account(address = USDC_MINT)]
+    pub usdc_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(args: LockStakeArgs)]
+pub struct LockStake8004<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(mut)]
+    pub owner: Signer<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint      = usdc_mint,
+        associated_token::authority = owner,
+    )]
+    pub owner_usdc: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init,
+        payer = payer,
+        space = StakeLockAccount::SIZE,
+        seeds = [b"stake", args.agent_mint.as_ref()],
+        bump
+    )]
+    pub stake_account: Box<Account<'info, StakeLockAccount>>,
+
+    /// CHECK: PDA used as token account authority only; holds no data.
+    #[account(
+        seeds = [b"stake_vault", args.agent_mint.as_ref()],
+        bump
+    )]
+    pub stake_vault_authority: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = payer,
+        associated_token::mint      = usdc_mint,
+        associated_token::authority = stake_vault_authority,
+    )]
+    pub stake_vault: Box<Account<'info, TokenAccount>>,
+
     #[account(address = USDC_MINT)]
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,

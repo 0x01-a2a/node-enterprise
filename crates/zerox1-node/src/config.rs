@@ -77,10 +77,18 @@ pub struct Config {
     #[arg(long, env = "ZX01_API_ADDR")]
     pub api_addr: Option<String>,
 
-    /// Secret bearer token to authenticate the API (e.g. for /envelopes/send).
+    /// Master secret bearer token to authenticate the API (e.g. for /envelopes/send).
     /// If absent, the API routes that mutate state will be unauthenticated.
     #[arg(long, env = "ZX01_API_SECRET")]
     pub api_secret: Option<String>,
+
+    /// Comma-separated read-only API keys for the visualization/explorer tier.
+    /// These keys grant access to GET endpoints and WebSocket streams
+    /// (/ws/events, /peers, /reputation, /batch, /ws/inbox) but NOT to
+    /// mutating endpoints like /envelopes/send.
+    /// Example: "explorer-abc123,devteam-xyz789"
+    #[arg(long, env = "ZX01_API_READ_KEYS", value_delimiter = ',')]
+    pub api_read_keys: Vec<String>,
 
     /// USDC SPL token mint address (base58).
     /// Required for inactivity slash enforcement — enables the node to receive
@@ -189,6 +197,11 @@ pub struct Config {
     /// Value of `C6W2...` (devnet) is the default and need not be set on devnet.
     #[arg(long, env = "ZX01_REGISTRY_8004_COLLECTION")]
     pub registry_8004_collection: Option<String>,
+
+    /// Agent IDs (hex) that are exempt from lease and registration checks.
+    /// Can be specified multiple times or as a comma-separated list. Used for infrastructure bots (like Guardian).
+    #[arg(long, env = "ZX01_EXEMPT_AGENTS", value_delimiter = ',')]
+    pub exempt_agents: Vec<String>,
 }
 
 impl Config {

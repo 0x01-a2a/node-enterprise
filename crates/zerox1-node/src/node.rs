@@ -146,6 +146,8 @@ pub struct Zx01Node {
     registry8004: Registry8004Client,
     /// Per-agent 8004 registry HTTP failure timestamps (same 1-hour backoff as SATI).
     reg8004_failures: HashMap<[u8; 32], std::time::Instant>,
+    /// Agent IDs exempt from lease and registration checks.
+    exempt_agents: std::collections::HashSet<[u8; 32]>,
 }
 
 impl Zx01Node {
@@ -186,6 +188,7 @@ impl Zx01Node {
             identity.agent_id,
             config.agent_name.clone(),
             config.api_secret.clone(),
+            config.api_read_keys.clone(),
             config.hosting_fee_bps,
             config.rpc_url.clone(),
             http_client.clone(),
@@ -193,6 +196,20 @@ impl Zx01Node {
         );
         let batch = BatchAccumulator::new(epoch, 0);
         let logger = EnvelopeLogger::new(log_dir, epoch);
+
+        let mut exempt_agents = std::collections::HashSet::new();
+        for hex_str in &config.exempt_agents {
+            if let Ok(bytes) = hex::decode(hex_str) {
+                if let Ok(arr) = bytes.try_into() {
+                    exempt_agents.insert(arr);
+                    tracing::info!("Registered exempt agent: {}", hex_str);
+                } else {
+                    tracing::warn!("Invalid exempt agent length (expected 32 bytes): {}", hex_str);
+                }
+            } else {
+                tracing::warn!("Invalid hex for exempt agent: {}", hex_str);
+            }
+        }
 
         if dev_mode {
             tracing::warn!(
@@ -248,6 +265,7 @@ impl Zx01Node {
             sati_rpc_failures: HashMap::new(),
             registry8004,
             reg8004_failures: HashMap::new(),
+            exempt_agents,
         }
     }
 
@@ -419,6 +437,45 @@ impl Zx01Node {
                     self.handle_outbound(swarm, req).await;
                 }
                 Some(env) = self.hosted_outbound_rx.recv() => {
+                    // Pre-verify hosted envelopes exactly like inbound ones to prevent DoS broadcast.
+                    if env.msg_type == MsgType::Beacon {
+                        if self.peer_states.sati_status(&env.sender).is_none() {
+                            if !self.config.registry_8004_disabled {
+                                let failed_8004 = self.reg8004_failures.get(&env.sender).map(|t| t.elapsed().as_secs() < 3600).unwrap_or(false);
+                                if !failed_8004 {
+                                    self.verify_8004_registration(env.sender).await;
+                                }
+                            }
+                            // SATI fallback
+                            if self.peer_states.sati_status(&env.sender).is_none() {
+                                let recently_failed = self.sati_rpc_failures.get(&env.sender).map(|t| t.elapsed().as_secs() < 3600).unwrap_or(false);
+                                if !recently_failed {
+                                    self.verify_sati_registration(env.sender).await;
+                                }
+                            }
+                        }
+                        if self.peer_states.lease_status(&env.sender).is_none()
+                            || self.peer_states.last_active_epoch(&env.sender) < self.current_epoch
+                        {
+                            self.verify_peer_lease(env.sender).await;
+                        }
+                    }
+                    
+                    if !self.sati_gate_allows(&env.sender) {
+                        tracing::warn!("Blocked hosted agent {} (unregistered)", hex::encode(env.sender));
+                        continue;
+                    }
+                    if !self.lease_gate_allows(&env.sender) {
+                        tracing::warn!("Blocked hosted agent {} (deactivated)", hex::encode(env.sender));
+                        continue;
+                    }
+
+                    // Record it in the batch so it's not bypassing the epoch logging!
+                    self.batch.record_message(env.msg_type, env.sender, self.current_slot);
+                    if let Err(e) = self.logger.log(&env) {
+                        tracing::warn!("Logger error on hosted outbound: {e}");
+                    }
+
                     if env.msg_type.is_bilateral() {
                         // Route bilateral hosted messages via request-response.
                         match self.peer_states.peer_id_for_agent(&env.recipient) {
@@ -478,8 +535,8 @@ impl Zx01Node {
     /// Called once at startup before check_own_lease().
     /// In dev mode, skip entirely.
     async fn ensure_stake_and_lease(&mut self) {
-        if self.dev_mode {
-            tracing::debug!("Dev mode — skipping auto-onboard.");
+        if self.dev_mode || self.exempt_agents.contains(&self.identity.agent_id) {
+            tracing::debug!("Dev mode or exempt agent — skipping auto-onboard.");
             return;
         }
 
@@ -530,8 +587,8 @@ impl Zx01Node {
     /// - Grace period: warn, continue (but should pay ASAP)
     /// - Needs renewal: auto-renew immediately
     async fn check_own_lease(&mut self) -> anyhow::Result<()> {
-        if self.dev_mode {
-            tracing::debug!("Dev mode — skipping own lease check.");
+        if self.dev_mode || self.exempt_agents.contains(&self.identity.agent_id) {
+            tracing::debug!("Dev mode or exempt agent — skipping own lease check.");
             return Ok(());
         }
 
@@ -581,7 +638,7 @@ impl Zx01Node {
     /// Check if own lease needs renewal and pay if so.
     /// Called at each epoch boundary.
     async fn maybe_renew_own_lease(&mut self) {
-        if self.dev_mode {
+        if self.dev_mode || self.exempt_agents.contains(&self.identity.agent_id) {
             return;
         }
         match lease::get_lease_status(&self.rpc, &self.identity.agent_id).await {
@@ -657,7 +714,7 @@ impl Zx01Node {
     /// - Dev mode: always true
     /// - Prod mode: false only when lease_status = Some(false)
     fn lease_gate_allows(&self, agent_id: &[u8; 32]) -> bool {
-        if self.dev_mode {
+        if self.dev_mode || self.exempt_agents.contains(agent_id) {
             return true;
         }
         !matches!(self.peer_states.lease_status(agent_id), Some(false))
@@ -669,7 +726,10 @@ impl Zx01Node {
 
     async fn poll_slot(&mut self) {
         match self.rpc.get_slot().await {
-            Ok(slot) => self.current_slot = slot,
+            Ok(slot) => {
+                self.current_slot = slot;
+                self.api.set_current_slot(slot);
+            }
             Err(e) => tracing::trace!("Slot poll failed: {e}"),
         }
     }
@@ -776,7 +836,10 @@ impl Zx01Node {
     /// In prod mode: true only if SATI status is confirmed `Some(true)` or
     ///               still `None` (not yet checked — optimistic until BEACON fires check).
     fn sati_gate_allows(&self, agent_id: &[u8; 32]) -> bool {
-        !matches!(self.peer_states.sati_status(agent_id), Some(false) if !self.dev_mode)
+        if self.dev_mode || self.exempt_agents.contains(agent_id) {
+            return true;
+        }
+        !matches!(self.peer_states.sati_status(agent_id), Some(false))
     }
 
     // ========================================================================
@@ -1088,23 +1151,23 @@ impl Zx01Node {
             {
                 self.verify_peer_lease(env.sender).await;
             }
-        } else {
-            if !self.sati_gate_allows(&env.sender) {
-                tracing::warn!(
-                    "Dropping {} from unregistered agent {}",
-                    env.msg_type,
-                    hex::encode(env.sender),
-                );
-                return;
-            }
-            if !self.lease_gate_allows(&env.sender) {
-                tracing::warn!(
-                    "Dropping {} from deactivated agent {}",
-                    env.msg_type,
-                    hex::encode(env.sender),
-                );
-                return;
-            }
+        }
+
+        if !self.sati_gate_allows(&env.sender) {
+            tracing::warn!(
+                "Dropping {} from unregistered agent {}",
+                env.msg_type,
+                hex::encode(env.sender),
+            );
+            return;
+        }
+        if !self.lease_gate_allows(&env.sender) {
+            tracing::warn!(
+                "Dropping {} from deactivated agent {}",
+                env.msg_type,
+                hex::encode(env.sender),
+            );
+            return;
         }
 
         // Update peer state.

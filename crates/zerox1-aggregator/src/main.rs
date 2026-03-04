@@ -5,6 +5,7 @@ mod store;
 
 use axum::{
     extract::DefaultBodyLimit,
+    middleware,
     routing::{get, post},
     Router,
 };
@@ -70,6 +71,15 @@ struct Config {
     /// Agents below this tier are treated as unregistered.
     #[arg(long, default_value = "0", env = "ZX01_REGISTRY_8004_MIN_TIER")]
     registry_8004_min_tier: u8,
+
+    /// Comma-separated API keys for gating read endpoints.
+    /// When set, all GET endpoints (reputation, leaderboard, agents, entropy,
+    /// interactions, etc.) require `Authorization: Bearer <key>`.
+    /// /health, /version, and internal POST endpoints (ingest, hosting) are exempt.
+    /// When absent, all read endpoints are public (dev/local mode).
+    /// Example: "explorer-abc123,devteam-xyz789,paid-client-001"
+    #[arg(long, env = "AGGREGATOR_API_KEYS", value_delimiter = ',')]
+    api_keys: Vec<String>,
 }
 
 #[tokio::main]
@@ -139,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         http_client,
         activity_tx,
         registry,
+        api_keys: config.api_keys,
     };
 
     if let Some(rpc_url) = config.solana_rpc {
@@ -154,11 +165,33 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("No --solana-rpc provided - Capital Flow analysis (GAP-02) disabled.");
     }
 
-    let app = Router::new()
+    // ── Public routes (no API key required) ──────────────────────────────
+    let public_routes = Router::new()
         .route("/health", get(api::health))
         .route("/version", get(api::get_version))
-        .route("/stats/network", get(api::get_network_stats))
+        // Internal push endpoints — use their own secrets
         .route("/ingest/envelope", post(api::ingest_envelope))
+        .route("/hosting/register", post(api::post_hosting_register))
+        // FCM registration & push-receive (agent-authenticated via Ed25519)
+        .route("/fcm/register", post(api::fcm_register))
+        .route("/fcm/sleep", post(api::fcm_sleep))
+        .route(
+            "/agents/{agent_id}/pending",
+            get(api::get_pending).post(api::post_pending),
+        )
+        // Agent-authenticated ownership endpoints
+        .route(
+            "/agents/{agent_id}/propose-owner",
+            post(api::post_propose_owner),
+        )
+        .route(
+            "/agents/{agent_id}/claim-owner",
+            post(api::post_claim_owner),
+        );
+
+    // ── API-key gated routes (read endpoints for explorer / dev team / paid clients) ──
+    let gated_routes = Router::new()
+        .route("/stats/network", get(api::get_network_stats))
         .route("/reputation/{agent_id}", get(api::get_reputation))
         .route("/leaderboard", get(api::get_leaderboard))
         .route("/agents", get(api::get_agents))
@@ -192,34 +225,23 @@ async fn main() -> anyhow::Result<()> {
         .route("/interactions/by/{agent_id}", get(api::get_interactions_by))
         .route("/disputes/{agent_id}", get(api::get_disputes))
         .route("/registry", get(api::get_registry))
-        .route("/fcm/register", post(api::fcm_register))
-        .route("/fcm/sleep", post(api::fcm_sleep))
         .route("/agents/{agent_id}/sleeping", get(api::get_sleep_status))
-        .route(
-            "/agents/{agent_id}/pending",
-            get(api::get_pending).post(api::post_pending),
-        )
         .route("/activity", get(api::get_activity))
         .route("/ws/activity", get(api::ws_activity))
-        .route("/hosting/register", post(api::post_hosting_register))
         .route("/hosting/nodes", get(api::get_hosting_nodes))
-        .route(
-            "/agents/{agent_id}/propose-owner",
-            post(api::post_propose_owner),
-        )
-        .route(
-            "/agents/{agent_id}/claim-owner",
-            post(api::post_claim_owner),
-        )
         .route("/agents/{agent_id}/owner", get(api::get_agent_owner))
-        // Blob routes carry a hard body cap so the tier check never has to
-        // buffer a multi-GB payload before rejecting it.  Max tier is 10 MB.
         .route(
             "/blobs",
             post(api::post_blob).layer(DefaultBodyLimit::max(10 * 1024 * 1024)),
         )
         .route("/blobs/{cid}", get(api::get_blob))
-        // INFO-2: Allow any origin but deny credential sharing (no allow_credentials).
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            api::api_key_middleware,
+        ));
+
+    let app = public_routes
+        .merge(gated_routes)
         .layer(
             tower_http::cors::CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
