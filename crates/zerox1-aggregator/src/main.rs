@@ -184,17 +184,15 @@ async fn main() -> anyhow::Result<()> {
             "/agents/{agent_id}/propose-owner",
             post(api::post_propose_owner),
         )
-        .route(
-            "/agents/{agent_id}/claim-owner",
-            post(api::post_claim_owner),
-        );
+        .route("/agents/{agent_id}/claim-owner", post(api::post_claim_owner))
+        // High-level public stats for the landing page
+        .route("/stats/network", get(api::get_network_stats))
+        .route("/agents", get(api::get_agents));
 
     // ── API-key gated routes (read endpoints for explorer / dev team / paid clients) ──
     let gated_routes = Router::new()
-        .route("/stats/network", get(api::get_network_stats))
         .route("/reputation/{agent_id}", get(api::get_reputation))
         .route("/leaderboard", get(api::get_leaderboard))
-        .route("/agents", get(api::get_agents))
         .route("/leaderboard/anomaly", get(api::get_anomaly_leaderboard))
         .route("/interactions", get(api::get_interactions))
         .route("/stats/timeseries", get(api::get_timeseries))
