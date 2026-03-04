@@ -2161,6 +2161,22 @@ impl ReputationStore {
         Ok(record)
     }
 
+    /// Return all agents whose ownership has been claimed by the given wallet.
+    pub fn get_agents_by_owner(&self, wallet: &str) -> Vec<AgentReputation> {
+        let claimed = self.ownership_claimed.lock().unwrap();
+        let agent_ids: Vec<String> = claimed
+            .values()
+            .filter(|r| r.owner.eq_ignore_ascii_case(wallet))
+            .map(|r| r.agent_id.clone())
+            .collect();
+        drop(claimed);
+        let inner = self.inner.read().unwrap();
+        agent_ids
+            .iter()
+            .filter_map(|id| inner.agents.get(id).cloned())
+            .collect()
+    }
+
     /// Return ownership status for an agent.
     pub fn get_owner(&self, agent_id: &str) -> OwnerStatus {
         if let Some(rec) = self.ownership_claimed.lock().unwrap().get(agent_id) {
@@ -2454,10 +2470,16 @@ impl ReputationStore {
                 None
             }
             IngestEvent::Beacon(ev) => {
-                // Record for BPM sliding window
+                // Record for BPM sliding window. Evict entries older than 60s
+                // on every push so the window stays bounded regardless of
+                // whether /stats/network is ever polled.
                 let now = now_secs();
                 {
                     let mut window = self.beacon_window.lock().unwrap();
+                    let cutoff = now.saturating_sub(60);
+                    while window.front().is_some_and(|&ts| ts < cutoff) {
+                        window.pop_front();
+                    }
                     window.push_back(now);
                 }
 

@@ -191,7 +191,9 @@ pub async fn ingest_envelope(
     }
     tracing::debug!("Ingest: received event: {:?}", event);
     if let Some(activity) = state.store.ingest(event) {
-        let _ = state.activity_tx.send(activity);
+        if let Err(e) = state.activity_tx.send(activity) {
+            tracing::warn!("Activity broadcast dropped (no active subscribers or channel full): {e}");
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -736,7 +738,10 @@ fn verify_request_signature(
     if pubkey_bytes.len() != 32 {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let pubkey = VerifyingKey::from_bytes(&pubkey_bytes.try_into().unwrap())
+    let pubkey_arr: [u8; 32] = pubkey_bytes
+        .try_into()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let pubkey = VerifyingKey::from_bytes(&pubkey_arr)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let sig_bytes = hex::decode(signature).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1273,6 +1278,21 @@ pub async fn get_agent_owner(
     // Fall back to legacy store
     let status: OwnerStatus = state.store.get_owner(&agent_id);
     Json(serde_json::to_value(status).unwrap_or_default())
+}
+
+/// GET /agents/by-owner/:wallet
+///
+/// Reverse-lookup: returns all agents whose ownership has been claimed by the
+/// given Solana wallet address (base58, 32-44 chars).
+pub async fn get_agents_by_owner(
+    Path(wallet): Path<String>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if wallet.len() < 32 || wallet.len() > 44 {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid wallet" }))).into_response();
+    }
+    let agents = state.store.get_agents_by_owner(&wallet);
+    Json(agents).into_response()
 }
 
 // ============================================================================

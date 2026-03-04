@@ -193,6 +193,7 @@ impl Zx01Node {
             config.rpc_url.clone(),
             http_client.clone(),
             config.registry_8004_collection.clone(),
+            std::sync::Arc::new(identity.signing_key.clone()),
         );
         let batch = BatchAccumulator::new(epoch, 0);
         let logger = EnvelopeLogger::new(log_dir, epoch);

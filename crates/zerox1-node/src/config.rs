@@ -8,9 +8,6 @@ use std::{path::PathBuf, str::FromStr};
 // ============================================================================
 //
 // These multiaddrs must be updated when the bootstrap fleet is deployed.
-// Format: /ip4/<addr>/tcp/<port>/p2p/<PeerId>
-// TODO: replace placeholders with real peer IDs once deployed.
-
 const DEFAULT_BOOTSTRAP_PEERS: &[&str] = &[
     // bootstrap-1.0x01.world (US Central)
     "/dns4/bootstrap-1.0x01.world/tcp/9000/p2p/12D3KooWLudabD69eAYzfoZMVRqJb8XHBLDKsQvRn6Q9hTQqvMuY",

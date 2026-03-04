@@ -179,6 +179,14 @@ const MAX_API_SENDS_PER_MINUTE: u32 = 120;
 /// Each request makes an external Solana RPC call, so cap tightly.
 const MAX_REGISTRY_PREPARE_PER_MINUTE: u32 = 10;
 
+// USDC sweep constants
+const USDC_MINT_DEVNET: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const SPL_ATA_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bJo";
+/// Minimum balance (atomic USDC units, 6 decimals) required to attempt a sweep.
+const MIN_SWEEP_AMOUNT: u64 = 10_000;
+
 struct RateLimitWindow {
     window_start: u64,
     count: u32,
@@ -264,6 +272,8 @@ struct ApiInner {
     // 8004 registry helpers
     /// Solana RPC URL — used by registry endpoints for blockhash + broadcast.
     rpc_url: String,
+    /// Node's own Ed25519 signing key — used for /wallet/sweep.
+    node_signing_key: Arc<SigningKey>,
     /// Shared HTTP client for registry RPC calls.
     http_client: reqwest::Client,
     /// Whether this node is pointed at mainnet-beta (affects 8004 program IDs).
@@ -293,6 +303,7 @@ impl ApiState {
         rpc_url: String,
         http_client: reqwest::Client,
         registry_8004_collection: Option<String>,
+        node_signing_key: Arc<SigningKey>,
     ) -> (
         Self,
         mpsc::Receiver<OutboundRequest>,
@@ -331,6 +342,7 @@ impl ApiState {
                 count: 0,
             }),
             rpc_url,
+            node_signing_key,
             http_client,
             is_mainnet,
             registry_8004_collection,
@@ -465,6 +477,8 @@ pub async fn serve(state: ApiState, addr: SocketAddr) {
         .route("/registry/8004/info", get(registry_8004_info))
         .route("/registry/8004/register-prepare", post(registry_8004_register_prepare))
         .route("/registry/8004/register-submit", post(registry_8004_register_submit))
+        // Hot wallet sweep
+        .route("/wallet/sweep", post(sweep_usdc))
         .layer(
             // INFO-2: Local API — only allow loopback origins (zeroclaw, React Native).
             tower_http::cors::CorsLayer::new()
@@ -600,28 +614,11 @@ async fn send_envelope(
     headers: HeaderMap,
     Json(req): Json<SendEnvelopeRequest>,
 ) -> impl IntoResponse {
-    // Authenticate outbound transmission requests.
-    let has_read_keys = !state.0.api_read_keys.is_empty();
-    if let Some(ref secret) = state.0.api_secret {
-        let expected = format!("Bearer {secret}");
-        let provided = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !ct_eq(provided, &expected) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "unauthorized" })),
-            );
-        }
-    } else if has_read_keys {
-        // If the user configured read keys but forgot the master secret,
-        // we must actively block write endpoints rather than defaulting to open access.
+    // Authenticate: only the master secret (not read-only keys) can send envelopes.
+    if let Some(_) = require_api_secret_or_unauthorized(&state, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(
-                serde_json::json!({ "error": "unauthorized: mutating endpoints require api_secret" }),
-            ),
+            Json(serde_json::json!({ "error": "unauthorized" })),
         );
     }
 
@@ -1617,6 +1614,223 @@ async fn registry_8004_register_submit(
         }
         Err(e) => {
             tracing::warn!("8004 registration broadcast failed: {e}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("broadcast failed: {e}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ============================================================================
+// Wallet sweep — POST /wallet/sweep
+// ============================================================================
+
+#[derive(Deserialize)]
+pub(crate) struct SweepRequest {
+    destination: String,
+}
+
+/// Convert an ed25519_dalek SigningKey to a solana_sdk Keypair.
+///
+/// solana_sdk::signature::Keypair is a 64-byte keypair: [secret(32) || public(32)].
+fn to_solana_keypair(sk: &SigningKey) -> solana_sdk::signature::Keypair {
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(&sk.to_bytes());
+    bytes[32..].copy_from_slice(sk.verifying_key().as_bytes());
+    solana_sdk::signature::Keypair::try_from(bytes.as_slice()).expect("valid ed25519 keypair bytes")
+}
+
+/// Derive the Associated Token Account address for a given owner and mint.
+fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+    let spl_token: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().expect("valid SPL_TOKEN_PROGRAM_ID");
+    let ata_program: Pubkey = SPL_ATA_PROGRAM_ID.parse().expect("valid SPL_ATA_PROGRAM_ID");
+    Pubkey::find_program_address(
+        &[&owner.to_bytes(), &spl_token.to_bytes(), &mint.to_bytes()],
+        &ata_program,
+    )
+    .0
+}
+
+/// POST /wallet/sweep
+///
+/// Transfers all USDC from the node's hot wallet ATA to `destination`.
+/// The destination must be a base58-encoded Solana wallet (not an ATA — the
+/// handler derives the destination ATA automatically).
+///
+/// Returns: `{ "signature": "...", "amount_usdc": 1.23, "destination": "..." }`
+pub async fn sweep_usdc(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(body): Json<SweepRequest>,
+) -> Response {
+    // CRITICAL: sweep moves real money — require master secret.
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    // 1. Validate destination pubkey.
+    let destination: Pubkey = match body.destination.parse() {
+        Ok(pk) => pk,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid destination pubkey" })),
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Derive agent's hot wallet pubkey.
+    let signing_key = Arc::clone(&state.0.node_signing_key);
+    let agent_pubkey: Pubkey = {
+        let vk_bytes = signing_key.verifying_key().to_bytes();
+        Pubkey::new_from_array(vk_bytes)
+    };
+
+    // 3. Select USDC mint based on network.
+    let usdc_mint_str = if state.0.is_mainnet {
+        USDC_MINT_MAINNET
+    } else {
+        USDC_MINT_DEVNET
+    };
+    let usdc_mint: Pubkey = usdc_mint_str.parse().expect("valid USDC mint");
+
+    // 4. Derive source and destination ATAs.
+    let source_ata = derive_ata(&agent_pubkey, &usdc_mint);
+    let dest_ata = derive_ata(&destination, &usdc_mint);
+
+    // 5. Query source ATA balance via RPC.
+    let balance_resp = state
+        .0
+        .http_client
+        .post(&state.0.rpc_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountBalance",
+            "params": [source_ata.to_string()]
+        }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+
+    let amount: u64 = match balance_resp {
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("RPC request failed: {e}") })),
+            )
+                .into_response();
+        }
+        Ok(resp) => {
+            let data: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({ "error": format!("RPC parse error: {e}") })),
+                    )
+                        .into_response();
+                }
+            };
+            if data.get("error").is_some() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "token account not found or has no balance" })),
+                )
+                    .into_response();
+            }
+            match data["result"]["value"]["amount"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                Some(v) => v,
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "error": "token account not found or has no balance" })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+
+    if amount < MIN_SWEEP_AMOUNT {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "balance too low to sweep",
+                "amount_atomic": amount,
+                "min_atomic": MIN_SWEEP_AMOUNT,
+            })),
+        )
+            .into_response();
+    }
+
+    // 6. Build SPL Token Transfer instruction (discriminant 3).
+    let spl_token_program: Pubkey =
+        SPL_TOKEN_PROGRAM_ID.parse().expect("valid SPL_TOKEN_PROGRAM_ID");
+    let mut ix_data = vec![3u8];
+    ix_data.extend_from_slice(&amount.to_le_bytes());
+    let transfer_ix = solana_sdk::instruction::Instruction {
+        program_id: spl_token_program,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(source_ata, false),
+            solana_sdk::instruction::AccountMeta::new(dest_ata, false),
+            solana_sdk::instruction::AccountMeta::new(agent_pubkey, true),
+        ],
+        data: ix_data,
+    };
+
+    // 7. Fetch recent blockhash.
+    let blockhash = match fetch_latest_blockhash(&state.0.rpc_url, &state.0.http_client).await {
+        Ok(bh) => bh,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("blockhash fetch failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    // 8. Build, sign, and serialize the transaction.
+    let solana_kp = to_solana_keypair(&signing_key);
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[transfer_ix],
+        Some(&agent_pubkey),
+        &[&solana_kp],
+        blockhash,
+    );
+
+    let serialized = match bincode::serialize(&tx) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("tx serialization failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let signed_b64 = B64.encode(&serialized);
+
+    // 9. Broadcast.
+    match broadcast_transaction(&state.0.rpc_url, &state.0.http_client, &signed_b64).await {
+        Ok(signature) => {
+            let amount_usdc = amount as f64 / 1_000_000.0;
+            tracing::info!("Swept {amount_usdc:.6} USDC → {destination}: tx={signature}");
+            Json(serde_json::json!({
+                "signature": signature,
+                "amount_usdc": amount_usdc,
+                "destination": destination.to_string(),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::warn!("sweep broadcast failed: {e}");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": format!("broadcast failed: {e}") })),

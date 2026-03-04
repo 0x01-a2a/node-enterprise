@@ -185,9 +185,18 @@ async fn main() -> anyhow::Result<()> {
             post(api::post_propose_owner),
         )
         .route("/agents/{agent_id}/claim-owner", post(api::post_claim_owner))
+        // Public ownership lookup — mobile app needs this without an API key
+        .route("/agents/{agent_id}/owner", get(api::get_agent_owner))
+        .route("/agents/by-owner/{wallet}", get(api::get_agents_by_owner))
         // High-level public stats for the landing page
         .route("/stats/network", get(api::get_network_stats))
-        .route("/agents", get(api::get_agents));
+        .route("/agents", get(api::get_agents))
+        // Mobile app read endpoints — must be public (mobile has no API key)
+        .route("/agents/{agent_id}/profile", get(api::get_agent_profile))
+        .route("/activity", get(api::get_activity))
+        .route("/ws/activity", get(api::ws_activity))
+        .route("/hosting/nodes", get(api::get_hosting_nodes))
+        .route("/blobs/{cid}", get(api::get_blob));
 
     // ── API-key gated routes (read endpoints for explorer / dev team / paid clients) ──
     let gated_routes = Router::new()
@@ -219,20 +228,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/agents/search", get(api::search_agents))
         .route("/agents/search/name", get(api::search_agents_by_name))
-        .route("/agents/{agent_id}/profile", get(api::get_agent_profile))
         .route("/interactions/by/{agent_id}", get(api::get_interactions_by))
         .route("/disputes/{agent_id}", get(api::get_disputes))
         .route("/registry", get(api::get_registry))
         .route("/agents/{agent_id}/sleeping", get(api::get_sleep_status))
-        .route("/activity", get(api::get_activity))
-        .route("/ws/activity", get(api::ws_activity))
-        .route("/hosting/nodes", get(api::get_hosting_nodes))
-        .route("/agents/{agent_id}/owner", get(api::get_agent_owner))
         .route(
             "/blobs",
             post(api::post_blob).layer(DefaultBodyLimit::max(10 * 1024 * 1024)),
         )
-        .route("/blobs/{cid}", get(api::get_blob))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             api::api_key_middleware,
