@@ -283,6 +283,7 @@ impl ApiState {
     ///
     /// Returns `(state, outbound_rx, hosted_outbound_rx)`. The caller (node)
     /// must hold onto both receivers and drive them in the main event loop.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         self_agent: [u8; 32],
         self_name: String,
