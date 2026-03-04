@@ -59,10 +59,26 @@ async fn index_capital_flows(rpc: &RpcClient, state: &AppState) -> anyhow::Resul
     let mut agent_to_externals: HashMap<String, HashSet<String>> = HashMap::new();
 
     // 2. Poll recent transactions for each agent
+    // Agent IDs may be hex (legacy SATI) or base58 (8004 registry)
     for agent_pubkey_str in active_agents {
-        let pk = match agent_pubkey_str.parse::<Pubkey>() {
-            Ok(p) => p,
-            Err(_) => continue,
+        let pk = if agent_pubkey_str.len() == 64
+            && agent_pubkey_str.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            // Legacy hex: decode 64 hex chars → 32 bytes → Pubkey
+            match hex::decode(&agent_pubkey_str) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&bytes);
+                    Pubkey::new_from_array(arr)
+                }
+                _ => continue,
+            }
+        } else {
+            // 8004 base58: parse directly as Solana Pubkey
+            match agent_pubkey_str.parse::<Pubkey>() {
+                Ok(p) => p,
+                Err(_) => continue,
+            }
         };
 
         let sigs = match rpc.get_signatures_for_address(&pk).await {

@@ -1,5 +1,6 @@
 mod api;
 mod capital_flow;
+mod registry_8004;
 mod store;
 
 use axum::{
@@ -59,6 +60,16 @@ struct Config {
     /// If absent, blob uploads are disabled.
     #[arg(long, env = "AGGREGATOR_BLOB_DIR")]
     blob_dir: Option<std::path::PathBuf>,
+
+    /// 8004 Agent Registry GraphQL indexer URL.
+    /// Defaults to the production indexer at Railway.
+    #[arg(long, env = "ZX01_REGISTRY_8004_URL")]
+    registry_8004_url: Option<String>,
+
+    /// Minimum trust tier for 8004 registry checks (0-4).
+    /// Agents below this tier are treated as unregistered.
+    #[arg(long, default_value = "0", env = "ZX01_REGISTRY_8004_MIN_TIER")]
+    registry_8004_min_tier: u8,
 }
 
 #[tokio::main]
@@ -106,14 +117,28 @@ async fn main() -> anyhow::Result<()> {
 
     let (activity_tx, _) = broadcast::channel::<ActivityEvent>(512);
 
+    let http_client = reqwest::Client::new();
+    let registry = registry_8004::Registry8004Client::new(
+        config.registry_8004_url.as_deref(),
+        http_client.clone(),
+        config.registry_8004_min_tier,
+    );
+
+    tracing::info!(
+        "8004 registry client configured: url={} min_tier={}",
+        registry.url,
+        config.registry_8004_min_tier,
+    );
+
     let state = AppState {
         store,
         ingest_secret: config.ingest_secret,
         hosting_secret: config.hosting_secret,
         blob_dir: config.blob_dir,
         fcm_server_key: config.fcm_server_key,
-        http_client: reqwest::Client::new(),
+        http_client,
         activity_tx,
+        registry,
     };
 
     if let Some(rpc_url) = config.solana_rpc {

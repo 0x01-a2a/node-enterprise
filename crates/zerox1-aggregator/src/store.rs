@@ -16,9 +16,20 @@ use serde::{Deserialize, Serialize};
 // Input validation
 // ============================================================================
 
-/// Agent IDs on the wire are hex-encoded 32-byte SATI mint addresses (64 chars).
+/// Validate agent IDs: accepts both legacy hex (64 chars) and 8004 base58 (32-44 chars).
 fn is_valid_agent_id(id: &str) -> bool {
-    id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+    if id.is_empty() || id.len() > 64 {
+        return false;
+    }
+    // Legacy: 64 hex chars (SATI mint)
+    if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    // 8004: base58 Solana pubkey (32-44 chars, alphanumeric no 0/O/I/l)
+    if id.len() >= 32 && id.len() <= 44 && bs58::decode(id).into_vec().is_ok() {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

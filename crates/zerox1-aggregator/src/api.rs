@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast;
 
+use crate::registry_8004::Registry8004Client;
 use crate::store::{
     ActivityEvent, AgentProfile, AgentRegistryEntry, CapabilityMatch, DisputeRecord, HostingNode,
     IngestEvent, NetworkStats, OwnerStatus, PendingMessage, ReputationStore,
@@ -42,6 +43,25 @@ pub struct AppState {
     pub activity_tx: broadcast::Sender<ActivityEvent>,
     /// Path to store media blobs.
     pub blob_dir: Option<PathBuf>,
+    /// 8004 Agent Registry client for on-chain identity checks.
+    pub registry: Registry8004Client,
+}
+
+// ============================================================================
+// Agent ID validation — accepts legacy hex (64 chars) and 8004 base58 (32-44)
+// ============================================================================
+
+fn is_valid_agent_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 64 {
+        return false;
+    }
+    if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    if id.len() >= 32 && id.len() <= 44 && bs58::decode(id).into_vec().is_ok() {
+        return true;
+    }
+    false
 }
 
 // ============================================================================
@@ -549,7 +569,7 @@ pub async fn get_agent_profile(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
-    if agent_id.len() != 64 || !agent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_agent_id(&agent_id) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid agent_id" })),
@@ -703,7 +723,7 @@ pub async fn fcm_register(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    if body.agent_id.len() != 64 || !body.agent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_agent_id(&body.agent_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
     state
@@ -733,7 +753,7 @@ pub async fn fcm_sleep(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    if body.agent_id.len() != 64 || !body.agent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_agent_id(&body.agent_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
     state.store.set_sleeping(&body.agent_id, body.sleeping);
@@ -806,7 +826,7 @@ pub async fn post_pending(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    if agent_id.len() != 64 || !agent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_agent_id(&agent_id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -1127,8 +1147,7 @@ pub async fn post_propose_owner(
     State(state): State<AppState>,
     Json(body): Json<ProposeOwnerBody>,
 ) -> impl IntoResponse {
-    // Validate agent_id format (64 hex chars = 32-byte SATI mint).
-    if agent_id.len() != 64 || !agent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_agent_id(&agent_id) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid agent_id" })),
@@ -1165,8 +1184,7 @@ pub async fn post_claim_owner(
     State(state): State<AppState>,
     Json(body): Json<ClaimOwnerBody>,
 ) -> impl IntoResponse {
-    // Validate agent_id format (64 hex chars = 32-byte SATI mint).
-    if agent_id.len() != 64 || !agent_id.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !is_valid_agent_id(&agent_id) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid agent_id" })),
@@ -1198,6 +1216,16 @@ pub async fn get_agent_owner(
     Path(agent_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // Try 8004 registry first for on-chain ownership
+    if let Ok(Some(owner)) = state.registry.get_owner(&agent_id).await {
+        return Json(json!({
+            "status": "claimed",
+            "agent_id": agent_id,
+            "owner": owner,
+            "source": "8004_registry"
+        }));
+    }
+    // Fall back to legacy store
     let status: OwnerStatus = state.store.get_owner(&agent_id);
     Json(serde_json::to_value(status).unwrap_or_default())
 }
@@ -1254,8 +1282,7 @@ pub async fn post_blob(
         .and_then(|h| h.to_str().ok())
         .unwrap_or(agent_id_hex); // dev-mode fallback: signer == agent_id
 
-    if agent_id_hex.len() != 64
-        || signer_hex.len() != 64
+    if !is_valid_agent_id(agent_id_hex)
         || timestamp_str.is_empty()
         || signature_hex.len() != 128
     {
@@ -1292,16 +1319,18 @@ pub async fn post_blob(
 
     // 2. Verify Signature
     // Use X-0x01-Signer for the crypto check; it equals X-0x01-Agent-Id in
-    // dev mode, but is the node's Ed25519 key (not the SATI mint) in SATI mode.
-    let signer_bytes = match hex::decode(signer_hex) {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid signer hex" })),
-            )
-                .into_response()
-        }
+    // dev mode, but is the node's Ed25519 key in SATI/8004 mode.
+    // Try hex decoding first (legacy), then base58 (8004).
+    let signer_bytes = if let Ok(b) = hex::decode(signer_hex) {
+        b
+    } else if let Ok(b) = bs58::decode(signer_hex).into_vec() {
+        b
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid signer (expected hex or base58)" })),
+        )
+            .into_response();
     };
     let sig_bytes = match hex::decode(signature_hex) {
         Ok(b) => b,
@@ -1359,8 +1388,14 @@ pub async fn post_blob(
     }
 
     // 3. Tier Check
+    // Check 8004 registry for on-chain registration (replaces legacy is_claimed)
     let score = state.store.get_agent_reputation_score(agent_id_hex);
-    let is_claimed = state.store.is_agent_claimed(agent_id_hex);
+    let is_registered = state
+        .registry
+        .is_registered_b58(agent_id_hex)
+        .await
+        .unwrap_or(false);
+    let is_claimed = is_registered || state.store.is_agent_claimed(agent_id_hex);
 
     let max_size = if is_claimed || score >= 100 {
         10 * 1024 * 1024 // 10 MB
