@@ -45,16 +45,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache Cargo registry + build
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-${{ matrix.platform }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.platform }}-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Build zerox1-node
         run: cargo build --release -p zerox1-node --target ${{ matrix.target }}
@@ -81,16 +80,15 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - name: Cache Cargo registry + build
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-android-arm64-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-android-arm64-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Cache cargo-ndk binary
         id: cache-cargo-ndk
@@ -125,16 +123,15 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-linux-x64-aggregator-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-linux-x64-aggregator-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Build aggregator
         run: cargo build --release -p zerox1-aggregator
@@ -184,16 +181,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-challenger-${{ matrix.platform }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-challenger-${{ matrix.platform }}-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: Build challenger
         run: cargo build --release -p zerox1-challenger --target ${{ matrix.target }}

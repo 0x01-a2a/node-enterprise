@@ -20,16 +20,15 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache Cargo
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-            target
-          key: cargo-ci-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-ci-
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
 
       - name: cargo check (all workspace crates)
         run: cargo check --workspace
