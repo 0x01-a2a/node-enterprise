@@ -15,7 +15,12 @@
 //!   POST /registry/8004/register-prepare  — Build partially-signed tx (agent signs message_b64)
 //!   POST /registry/8004/register-submit   — Inject owner sig + broadcast to Solana
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use axum::{
     extract::{
@@ -24,7 +29,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -282,6 +287,11 @@ struct ApiInner {
     registry_8004_collection: Option<String>,
     /// The current Solana slot, continuously updated by the node event loop.
     current_slot: core::sync::atomic::AtomicU64,
+    /// Agent IDs exempt from stake/lease/registration checks.
+    /// Shared with Node so either side can read it; admin API writes via POST/DELETE /admin/exempt.
+    exempt_agents: Arc<std::sync::RwLock<HashSet<[u8; 32]>>>,
+    /// Path to persist exempt_agents across restarts (log_dir/exempt_agents.json).
+    exempt_persist_path: PathBuf,
 }
 
 /// Cheaply cloneable shared state passed to all axum handlers.
@@ -304,6 +314,8 @@ impl ApiState {
         http_client: reqwest::Client,
         registry_8004_collection: Option<String>,
         node_signing_key: Arc<SigningKey>,
+        exempt_agents: Arc<std::sync::RwLock<HashSet<[u8; 32]>>>,
+        exempt_persist_path: PathBuf,
     ) -> (
         Self,
         mpsc::Receiver<OutboundRequest>,
@@ -347,6 +359,8 @@ impl ApiState {
             is_mainnet,
             registry_8004_collection,
             current_slot: core::sync::atomic::AtomicU64::new(0),
+            exempt_agents,
+            exempt_persist_path,
         }));
 
         (state, outbound_rx, hosted_outbound_rx)
@@ -479,6 +493,9 @@ pub async fn serve(state: ApiState, addr: SocketAddr) {
         .route("/registry/8004/register-submit", post(registry_8004_register_submit))
         // Hot wallet sweep
         .route("/wallet/sweep", post(sweep_usdc))
+        // Admin — exempt agent management (loopback only; requires api_secret)
+        .route("/admin/exempt", get(admin_exempt_list).post(admin_exempt_add))
+        .route("/admin/exempt/{agent_id}", delete(admin_exempt_remove))
         .layer(
             // INFO-2: Local API — only allow loopback origins (zeroclaw, React Native).
             tower_http::cors::CorsLayer::new()
@@ -490,7 +507,11 @@ pub async fn serve(state: ApiState, addr: SocketAddr) {
                         .parse::<axum::http::HeaderValue>()
                         .expect("hardcoded CORS origin 'localhost' failed to parse"),
                 ])
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::DELETE,
+                ])
                 .allow_headers(tower_http::cors::Any),
         )
         .with_state(state);
@@ -1838,4 +1859,137 @@ pub async fn sweep_usdc(
                 .into_response()
         }
     }
+}
+
+// ============================================================================
+// Admin — exempt agent management
+//
+// All three routes require the master api_secret (Authorization: Bearer <secret>).
+// They are registered on the same local API server (127.0.0.1:9090 by default),
+// so they are only reachable by someone with SSH access to the host.
+//
+// Usage (from GCP instance or via ssh -L tunnel):
+//   # Add Guardian NPC
+//   curl -X POST http://127.0.0.1:9090/admin/exempt \
+//        -H 'Authorization: Bearer <api_secret>' \
+//        -H 'Content-Type: application/json' \
+//        -d '{"agent_id":"<64-hex-char-agent-id>"}'
+//
+//   # List current exemptions
+//   curl -H 'Authorization: Bearer <api_secret>' http://127.0.0.1:9090/admin/exempt
+//
+//   # Remove an exemption
+//   curl -X DELETE -H 'Authorization: Bearer <api_secret>' \
+//        http://127.0.0.1:9090/admin/exempt/<64-hex-char-agent-id>
+//
+// Changes are persisted to log_dir/exempt_agents.json and survive node restarts.
+// ============================================================================
+
+fn save_exempt_agents(path: &std::path::Path, set: &HashSet<[u8; 32]>) {
+    let ids: Vec<String> = set.iter().map(hex::encode).collect();
+    match serde_json::to_string(&ids) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(path, &json) {
+                tracing::warn!("Failed to persist exempt_agents to {:?}: {e}", path);
+            }
+        }
+        Err(e) => tracing::warn!("Failed to serialize exempt_agents: {e}"),
+    }
+}
+
+/// GET /admin/exempt — list all currently exempt agent IDs.
+async fn admin_exempt_list(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let set = state.0.exempt_agents.read().unwrap();
+    let ids: Vec<String> = set.iter().map(hex::encode).collect();
+    Json(serde_json::json!({ "exempt_agents": ids, "count": ids.len() })).into_response()
+}
+
+/// POST /admin/exempt — add an agent ID to the exempt set.
+/// Body: `{ "agent_id": "<64-hex-char-id>" }`
+async fn admin_exempt_add(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let Some(hex_str) = body.get("agent_id").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "agent_id required" })),
+        )
+            .into_response();
+    };
+    let bytes = match hex::decode(hex_str) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid hex" })),
+            )
+                .into_response()
+        }
+    };
+    let arr: [u8; 32] = match bytes.try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "agent_id must be 32 bytes (64 hex chars)" })),
+            )
+                .into_response()
+        }
+    };
+    {
+        let mut set = state.0.exempt_agents.write().unwrap();
+        set.insert(arr);
+        save_exempt_agents(&state.0.exempt_persist_path, &set);
+    }
+    tracing::info!("Admin: added exempt agent {hex_str}");
+    Json(serde_json::json!({ "ok": true, "agent_id": hex_str })).into_response()
+}
+
+/// DELETE /admin/exempt/{agent_id} — remove an agent ID from the exempt set.
+async fn admin_exempt_remove(
+    headers: HeaderMap,
+    Path(agent_id): Path<String>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let bytes = match hex::decode(&agent_id) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid hex" })),
+            )
+                .into_response()
+        }
+    };
+    let arr: [u8; 32] = match bytes.try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "agent_id must be 32 bytes (64 hex chars)" })),
+            )
+                .into_response()
+        }
+    };
+    {
+        let mut set = state.0.exempt_agents.write().unwrap();
+        set.remove(&arr);
+        save_exempt_agents(&state.0.exempt_persist_path, &set);
+    }
+    tracing::info!("Admin: removed exempt agent {agent_id}");
+    Json(serde_json::json!({ "ok": true })).into_response()
 }

@@ -147,7 +147,8 @@ pub struct Zx01Node {
     /// Per-agent 8004 registry HTTP failure timestamps (same 1-hour backoff as SATI).
     reg8004_failures: HashMap<[u8; 32], std::time::Instant>,
     /// Agent IDs exempt from lease and registration checks.
-    exempt_agents: std::collections::HashSet<[u8; 32]>,
+    /// Shared with ApiState so the admin API can mutate it at runtime without restart.
+    exempt_agents: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<[u8; 32]>>>,
 }
 
 impl Zx01Node {
@@ -184,6 +185,39 @@ impl Zx01Node {
         let usdc_mint = config.usdc_mint_pubkey().ok().flatten();
         let aggregator_url = validated_aggregator_url(config.aggregator_url.clone());
         let aggregator_secret = config.aggregator_secret.clone();
+        // ── Exempt agents: load persisted runtime mutations + merge env/CLI config ──
+        let exempt_persist_path = config.log_dir.join("exempt_agents.json");
+        let mut exempt_set = std::collections::HashSet::<[u8; 32]>::new();
+
+        if let Ok(data) = std::fs::read_to_string(&exempt_persist_path) {
+            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&data) {
+                for hex_str in ids {
+                    if let Ok(bytes) = hex::decode(&hex_str) {
+                        if let Ok(arr) = bytes.try_into() {
+                            exempt_set.insert(arr);
+                            tracing::info!("Loaded exempt agent from persist: {}", hex_str);
+                        }
+                    }
+                }
+            }
+        }
+
+        for hex_str in &config.exempt_agents {
+            if let Ok(bytes) = hex::decode(hex_str) {
+                if let Ok(arr) = bytes.try_into() {
+                    if exempt_set.insert(arr) {
+                        tracing::info!("Registered exempt agent: {}", hex_str);
+                    }
+                } else {
+                    tracing::warn!("Invalid exempt agent length (expected 32 bytes): {}", hex_str);
+                }
+            } else {
+                tracing::warn!("Invalid hex for exempt agent: {}", hex_str);
+            }
+        }
+
+        let exempt_agents = std::sync::Arc::new(std::sync::RwLock::new(exempt_set));
+
         let (api, outbound_rx, hosted_outbound_rx) = ApiState::new(
             identity.agent_id,
             config.agent_name.clone(),
@@ -194,23 +228,11 @@ impl Zx01Node {
             http_client.clone(),
             config.registry_8004_collection.clone(),
             std::sync::Arc::new(identity.signing_key.clone()),
+            std::sync::Arc::clone(&exempt_agents),
+            exempt_persist_path,
         );
         let batch = BatchAccumulator::new(epoch, 0);
         let logger = EnvelopeLogger::new(log_dir, epoch);
-
-        let mut exempt_agents = std::collections::HashSet::new();
-        for hex_str in &config.exempt_agents {
-            if let Ok(bytes) = hex::decode(hex_str) {
-                if let Ok(arr) = bytes.try_into() {
-                    exempt_agents.insert(arr);
-                    tracing::info!("Registered exempt agent: {}", hex_str);
-                } else {
-                    tracing::warn!("Invalid exempt agent length (expected 32 bytes): {}", hex_str);
-                }
-            } else {
-                tracing::warn!("Invalid hex for exempt agent: {}", hex_str);
-            }
-        }
 
         if dev_mode {
             tracing::warn!(
@@ -536,7 +558,7 @@ impl Zx01Node {
     /// Called once at startup before check_own_lease().
     /// In dev mode, skip entirely.
     async fn ensure_stake_and_lease(&mut self) {
-        if self.dev_mode || self.exempt_agents.contains(&self.identity.agent_id) {
+        if self.dev_mode || self.exempt_agents.read().unwrap().contains(&self.identity.agent_id) {
             tracing::debug!("Dev mode or exempt agent — skipping auto-onboard.");
             return;
         }
@@ -588,7 +610,7 @@ impl Zx01Node {
     /// - Grace period: warn, continue (but should pay ASAP)
     /// - Needs renewal: auto-renew immediately
     async fn check_own_lease(&mut self) -> anyhow::Result<()> {
-        if self.dev_mode || self.exempt_agents.contains(&self.identity.agent_id) {
+        if self.dev_mode || self.exempt_agents.read().unwrap().contains(&self.identity.agent_id) {
             tracing::debug!("Dev mode or exempt agent — skipping own lease check.");
             return Ok(());
         }
@@ -639,7 +661,7 @@ impl Zx01Node {
     /// Check if own lease needs renewal and pay if so.
     /// Called at each epoch boundary.
     async fn maybe_renew_own_lease(&mut self) {
-        if self.dev_mode || self.exempt_agents.contains(&self.identity.agent_id) {
+        if self.dev_mode || self.exempt_agents.read().unwrap().contains(&self.identity.agent_id) {
             return;
         }
         match lease::get_lease_status(&self.rpc, &self.identity.agent_id).await {
@@ -715,7 +737,7 @@ impl Zx01Node {
     /// - Dev mode: always true
     /// - Prod mode: false only when lease_status = Some(false)
     fn lease_gate_allows(&self, agent_id: &[u8; 32]) -> bool {
-        if self.dev_mode || self.exempt_agents.contains(agent_id) {
+        if self.dev_mode || self.exempt_agents.read().unwrap().contains(agent_id) {
             return true;
         }
         !matches!(self.peer_states.lease_status(agent_id), Some(false))
@@ -837,7 +859,7 @@ impl Zx01Node {
     /// In prod mode: true only if SATI status is confirmed `Some(true)` or
     ///               still `None` (not yet checked — optimistic until BEACON fires check).
     fn sati_gate_allows(&self, agent_id: &[u8; 32]) -> bool {
-        if self.dev_mode || self.exempt_agents.contains(agent_id) {
+        if self.dev_mode || self.exempt_agents.read().unwrap().contains(agent_id) {
             return true;
         }
         !matches!(self.peer_states.sati_status(agent_id), Some(false))

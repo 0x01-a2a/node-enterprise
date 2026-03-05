@@ -1,9 +1,15 @@
 {
   "name": "@zerox1/sdk-win32-x64",
-  "version": "0.1.20",
+  "version": "0.2.15",
   "description": "zerox1-node binary for Windows x64",
-  "os": ["win32"],
-  "cpu": ["x64"],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
   "license": "MIT",
-  "files": ["bin/"]
+  "files": [
+    "bin/"
+  ]
 }
