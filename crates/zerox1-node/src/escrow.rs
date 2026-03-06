@@ -4,17 +4,18 @@
 //! Payload convention: [verdict_type(1)][requester(32)][provider(32)]
 #![allow(dead_code)]
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use sha2::{Digest, Sha256};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     message::Message,
     pubkey::Pubkey,
-    signature::Keypair,
+    signature::{Keypair, Signature},
     transaction::Transaction,
 };
 
-use crate::lease::get_ata;
+use crate::{kora::KoraClient, lease::get_ata};
 
 // ============================================================================
 // Constants
@@ -91,6 +92,7 @@ pub async fn lock_payment_onchain(
     notary_fee: u64,
     notary_pubkey: Option<Pubkey>,
     timeout_slots: u64,
+    kora: Option<&KoraClient>,
 ) -> anyhow::Result<()> {
     let usdc = usdc_mint();
     let requester_pubkey = Pubkey::new_from_array(vk_bytes);
@@ -101,38 +103,70 @@ pub async fn lock_payment_onchain(
     let vault_ata = get_ata(&vault_auth, &usdc, &spl_token_program());
     let requester_ata = get_ata(&requester_pubkey, &usdc, &spl_token_program());
 
-    let ix = build_lock_payment_ix(
-        &requester_pubkey,
-        &provider_pubkey,
-        &escrow_key,
-        &vault_auth,
-        &vault_ata,
-        &requester_ata,
-        &usdc,
-        conversation_id,
-        amount,
-        notary_fee,
-        notary_pubkey,
-        timeout_slots,
-    );
-
     let mut kp_bytes = [0u8; 64];
     kp_bytes[..32].copy_from_slice(&sk_bytes);
     kp_bytes[32..].copy_from_slice(&vk_bytes);
     let kp = Keypair::try_from(kp_bytes.as_slice()).map_err(|e| anyhow::anyhow!("keypair: {e}"))?;
 
     let blockhash = rpc.get_latest_blockhash().await?;
-    let msg = Message::new_with_blockhash(&[ix], Some(&requester_pubkey), &blockhash);
-    let mut tx = Transaction::new_unsigned(msg);
-    tx.sign(&[&kp], blockhash);
 
-    let sig = rpc.send_and_confirm_transaction(&tx).await?;
-    tracing::info!(
-        "Escrow lock_payment confirmed: {} (provider={}, amount={})",
-        sig,
-        hex::encode(provider_bytes),
-        amount
-    );
+    if let Some(kora) = kora {
+        let fee_payer = kora.get_fee_payer().await?;
+        let ix = build_lock_payment_ix(
+            &requester_pubkey,
+            &provider_pubkey,
+            &escrow_key,
+            &vault_auth,
+            &vault_ata,
+            &requester_ata,
+            &usdc,
+            conversation_id,
+            amount,
+            notary_fee,
+            notary_pubkey,
+            timeout_slots,
+        );
+        let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &blockhash);
+        let mut tx = Transaction {
+            signatures: vec![Signature::default(); message.header.num_required_signatures as usize],
+            message,
+        };
+        tx.partial_sign(&[&kp], blockhash);
+        let tx_b64 = BASE64.encode(
+            &bincode::serialize(&tx).map_err(|e| anyhow::anyhow!("bincode serialize: {e}"))?,
+        );
+        kora.sign_and_send(&tx_b64).await?;
+        tracing::info!(
+            "Escrow lock_payment via Kora (gasless): provider={}, amount={}",
+            hex::encode(provider_bytes),
+            amount
+        );
+    } else {
+        let ix = build_lock_payment_ix(
+            &requester_pubkey,
+            &provider_pubkey,
+            &escrow_key,
+            &vault_auth,
+            &vault_ata,
+            &requester_ata,
+            &usdc,
+            conversation_id,
+            amount,
+            notary_fee,
+            notary_pubkey,
+            timeout_slots,
+        );
+        let msg = Message::new_with_blockhash(&[ix], Some(&requester_pubkey), &blockhash);
+        let mut tx = Transaction::new_unsigned(msg);
+        tx.sign(&[&kp], blockhash);
+        let sig = rpc.send_and_confirm_transaction(&tx).await?;
+        tracing::info!(
+            "Escrow lock_payment confirmed: {} (provider={}, amount={})",
+            sig,
+            hex::encode(provider_bytes),
+            amount
+        );
+    }
     Ok(())
 }
 
@@ -148,6 +182,7 @@ pub async fn approve_payment_onchain(
     provider_bytes: [u8; 32],
     conversation_id: [u8; 16],
     notary_bytes: [u8; 32],
+    kora: Option<&KoraClient>,
 ) -> anyhow::Result<()> {
     let usdc = usdc_mint();
     let treasury_key = treasury();
@@ -183,17 +218,36 @@ pub async fn approve_payment_onchain(
     let kp = Keypair::try_from(kp_bytes.as_slice()).map_err(|e| anyhow::anyhow!("keypair: {e}"))?;
 
     let blockhash = rpc.get_latest_blockhash().await?;
-    let msg = Message::new_with_blockhash(&[ix], Some(&approver_pubkey), &blockhash);
-    let mut tx = Transaction::new_unsigned(msg);
-    tx.sign(&[&kp], blockhash);
 
-    let sig = rpc.send_and_confirm_transaction(&tx).await?;
-    tracing::info!(
-        "Escrow approve_payment confirmed: {} (requester={}, provider={})",
-        sig,
-        hex::encode(requester_bytes),
-        hex::encode(provider_bytes),
-    );
+    if let Some(kora) = kora {
+        let fee_payer = kora.get_fee_payer().await?;
+        let message = Message::new_with_blockhash(&[ix], Some(&fee_payer), &blockhash);
+        let mut tx = Transaction {
+            signatures: vec![Signature::default(); message.header.num_required_signatures as usize],
+            message,
+        };
+        tx.partial_sign(&[&kp], blockhash);
+        let tx_b64 = BASE64.encode(
+            &bincode::serialize(&tx).map_err(|e| anyhow::anyhow!("bincode serialize: {e}"))?,
+        );
+        kora.sign_and_send(&tx_b64).await?;
+        tracing::info!(
+            "Escrow approve_payment via Kora (gasless): requester={}, provider={}",
+            hex::encode(requester_bytes),
+            hex::encode(provider_bytes),
+        );
+    } else {
+        let msg = Message::new_with_blockhash(&[ix], Some(&approver_pubkey), &blockhash);
+        let mut tx = Transaction::new_unsigned(msg);
+        tx.sign(&[&kp], blockhash);
+        let sig = rpc.send_and_confirm_transaction(&tx).await?;
+        tracing::info!(
+            "Escrow approve_payment confirmed: {} (requester={}, provider={})",
+            sig,
+            hex::encode(requester_bytes),
+            hex::encode(provider_bytes),
+        );
+    }
     Ok(())
 }
 

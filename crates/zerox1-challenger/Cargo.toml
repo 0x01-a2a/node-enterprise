@@ -26,3 +26,6 @@ base64                       = { workspace = true }
 sha2                         = { workspace = true }
 zerox1-protocol              = { path = "../zerox1-protocol" }
 openssl                      = { workspace = true }
+
+[features]
+mainnet = []

@@ -1,6 +1,6 @@
 {
   "name": "@zerox1/sdk",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "description": "0x01 mesh agent SDK — zero-config, binary bundled, works on every platform",
   "license": "MIT",
   "main": "dist/index.js",
@@ -14,10 +14,10 @@
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
-    "@zerox1/sdk-darwin-arm64": "0.2.15",
-    "@zerox1/sdk-darwin-x64": "0.2.15",
-    "@zerox1/sdk-linux-x64": "0.2.15",
-    "@zerox1/sdk-win32-x64": "0.2.15"
+    "@zerox1/sdk-darwin-arm64": "0.2.16",
+    "@zerox1/sdk-darwin-x64": "0.2.16",
+    "@zerox1/sdk-linux-x64": "0.2.16",
+    "@zerox1/sdk-win32-x64": "0.2.16"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

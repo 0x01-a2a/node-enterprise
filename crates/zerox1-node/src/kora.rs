@@ -78,6 +78,7 @@ struct SignAndSendResult {
 /// let tx_b64 = base64_encode(bincode_serialize(tx));
 /// kora.sign_and_send(&tx_b64).await?;
 /// ```
+#[derive(Clone)]
 pub struct KoraClient {
     url: String,
     http: reqwest::Client,

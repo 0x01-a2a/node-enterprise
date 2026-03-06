@@ -16,6 +16,9 @@ use zerox1_protocol::hash::keccak256;
 // Program IDs
 const CHALLENGE_PROGRAM_ID: &str = "7FoisCiS1gyUx7osQkCLk4A1zNKGq37yHpVhL2BFgk1Y";
 const BEHAVIOR_LOG_PROGRAM_ID: &str = "35DAMPQVu6wsmMEGv67URFAGgyauEYD73egd74uiX1sM";
+#[cfg(feature = "mainnet")]
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // Mainnet USDC
+#[cfg(not(feature = "mainnet"))]
 const USDC_MINT: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"; // Devnet USDC
 
 const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";

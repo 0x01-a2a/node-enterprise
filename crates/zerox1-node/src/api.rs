@@ -39,9 +39,12 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 
-use crate::registry_8004::{
-    broadcast_transaction, build_register_tx, fetch_latest_blockhash, COLLECTION_DEVNET,
-    PROGRAM_ID_DEVNET, PROGRAM_ID_MAINNET,
+use crate::{
+    kora::KoraClient,
+    registry_8004::{
+        broadcast_transaction, build_register_tx, fetch_latest_blockhash, COLLECTION_DEVNET,
+        PROGRAM_ID_DEVNET, PROGRAM_ID_MAINNET,
+    },
 };
 
 use zerox1_protocol::{
@@ -283,6 +286,8 @@ struct ApiInner {
     http_client: reqwest::Client,
     /// Whether this node is pointed at mainnet-beta (affects 8004 program IDs).
     is_mainnet: bool,
+    /// Kora paymaster client — present when --kora-url is configured.
+    kora: Option<KoraClient>,
     /// Optional override for the 8004 base collection (required on mainnet).
     registry_8004_collection: Option<String>,
     /// The current Solana slot, continuously updated by the node event loop.
@@ -314,6 +319,7 @@ impl ApiState {
         http_client: reqwest::Client,
         registry_8004_collection: Option<String>,
         node_signing_key: Arc<SigningKey>,
+        kora: Option<KoraClient>,
         exempt_agents: Arc<std::sync::RwLock<HashSet<[u8; 32]>>>,
         exempt_persist_path: PathBuf,
     ) -> (
@@ -357,6 +363,7 @@ impl ApiState {
             node_signing_key,
             http_client,
             is_mainnet,
+            kora,
             registry_8004_collection,
             current_slot: core::sync::atomic::AtomicU64::new(0),
             exempt_agents,
@@ -1817,46 +1824,104 @@ pub async fn sweep_usdc(
         }
     };
 
-    // 8. Build, sign, and serialize the transaction.
+    // 8. Build, sign, and broadcast — Kora pays gas if configured, otherwise agent pays SOL.
     let solana_kp = to_solana_keypair(&signing_key);
-    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
-        &[transfer_ix],
-        Some(&agent_pubkey),
-        &[&solana_kp],
-        blockhash,
-    );
 
-    let serialized = match bincode::serialize(&tx) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("tx serialization failed: {e}") })),
-            )
-                .into_response();
-        }
-    };
-    let signed_b64 = B64.encode(&serialized);
-
-    // 9. Broadcast.
-    match broadcast_transaction(&state.0.rpc_url, &state.0.http_client, &signed_b64).await {
-        Ok(signature) => {
-            let amount_usdc = amount as f64 / 1_000_000.0;
-            tracing::info!("Swept {amount_usdc:.6} USDC → {destination}: tx={signature}");
-            Json(serde_json::json!({
-                "signature": signature,
-                "amount_usdc": amount_usdc,
-                "destination": destination.to_string(),
-            }))
-            .into_response()
-        }
-        Err(e) => {
-            tracing::warn!("sweep broadcast failed: {e}");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": format!("broadcast failed: {e}") })),
-            )
+    if let Some(kora) = state.0.kora.as_ref() {
+        // ── Kora path: agent partial-signs, Kora adds fee-payer sig + broadcasts ──
+        let fee_payer = match kora.get_fee_payer().await {
+            Ok(fp) => fp,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": format!("Kora fee payer failed: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+        let message = solana_sdk::message::Message::new_with_blockhash(
+            &[transfer_ix],
+            Some(&fee_payer),
+            &blockhash,
+        );
+        let mut tx = solana_sdk::transaction::Transaction {
+            signatures: vec![
+                solana_sdk::signature::Signature::default();
+                message.header.num_required_signatures as usize
+            ],
+            message,
+        };
+        tx.partial_sign(&[&solana_kp], blockhash);
+        let tx_b64 = match bincode::serialize(&tx) {
+            Ok(b) => B64.encode(&b),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("tx serialization failed: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+        match kora.sign_and_send(&tx_b64).await {
+            Ok(signer) => {
+                let amount_usdc = amount as f64 / 1_000_000.0;
+                tracing::info!(
+                    "Swept {amount_usdc:.6} USDC → {destination} via Kora (gasless, signer={signer})"
+                );
+                Json(serde_json::json!({
+                    "amount_usdc": amount_usdc,
+                    "destination": destination.to_string(),
+                    "via": "kora",
+                }))
                 .into_response()
+            }
+            Err(e) => {
+                tracing::warn!("sweep via Kora failed: {e}");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": format!("Kora broadcast failed: {e}") })),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        // ── Direct path: agent is fee payer (requires SOL) ───────────────────
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &[transfer_ix],
+            Some(&agent_pubkey),
+            &[&solana_kp],
+            blockhash,
+        );
+        let serialized = match bincode::serialize(&tx) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("tx serialization failed: {e}") })),
+                )
+                    .into_response();
+            }
+        };
+        let signed_b64 = B64.encode(&serialized);
+        match broadcast_transaction(&state.0.rpc_url, &state.0.http_client, &signed_b64).await {
+            Ok(signature) => {
+                let amount_usdc = amount as f64 / 1_000_000.0;
+                tracing::info!("Swept {amount_usdc:.6} USDC → {destination}: tx={signature}");
+                Json(serde_json::json!({
+                    "signature": signature,
+                    "amount_usdc": amount_usdc,
+                    "destination": destination.to_string(),
+                }))
+                .into_response()
+            }
+            Err(e) => {
+                tracing::warn!("sweep broadcast failed: {e}");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({ "error": format!("broadcast failed: {e}") })),
+                )
+                    .into_response()
+            }
         }
     }
 }

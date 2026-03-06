@@ -228,6 +228,7 @@ impl Zx01Node {
             http_client.clone(),
             config.registry_8004_collection.clone(),
             std::sync::Arc::new(identity.signing_key.clone()),
+            kora.clone(),
             std::sync::Arc::clone(&exempt_agents),
             exempt_persist_path,
         );
@@ -301,6 +302,17 @@ impl Zx01Node {
         if let Some(ref addr_str) = self.config.api_addr.clone() {
             match addr_str.parse::<std::net::SocketAddr>() {
                 Ok(addr) => {
+                    // Safety: refuse to bind to a non-loopback address without an API secret.
+                    // Without a secret every mutating endpoint (/envelopes/send, /wallet/sweep,
+                    // /registry/8004/register-*) would be open to anyone on the network.
+                    if !addr.ip().is_loopback() && self.config.api_secret.is_none() {
+                        anyhow::bail!(
+                            "--api-addr {} is a non-loopback address but --api-secret is not \
+                             set. All mutating endpoints would be unauthenticated. \
+                             Set ZX01_API_SECRET or bind to 127.0.0.1.",
+                            addr
+                        );
+                    }
                     let api = self.api.clone();
                     tokio::spawn(crate::api::serve(api, addr));
                 }
@@ -1822,6 +1834,7 @@ impl Zx01Node {
                     let conv_id = req.conversation_id;
                     // notary_bytes = our own vk (we are the notary sending this VERDICT).
                     let notary_bytes = vk_bytes;
+                    let kora = self.kora.clone();
                     tokio::spawn(async move {
                         use solana_rpc_client::nonblocking::rpc_client::RpcClient as SolanaRpc;
                         if let Err(e) = crate::escrow::approve_payment_onchain(
@@ -1832,6 +1845,7 @@ impl Zx01Node {
                             provider,
                             conv_id,
                             notary_bytes,
+                            kora.as_ref(),
                         )
                         .await
                         {
@@ -1855,6 +1869,7 @@ impl Zx01Node {
                         // 10% notary fee, 1000 slot timeout; notary assigned via try_assign_notary.
                         let notary_fee = amount / 10;
                         let timeout_slots = 1000_u64;
+                        let kora = self.kora.clone();
                         tokio::spawn(async move {
                             use solana_rpc_client::nonblocking::rpc_client::RpcClient as SolanaRpc;
                             if let Err(e) = crate::escrow::lock_payment_onchain(
@@ -1867,6 +1882,7 @@ impl Zx01Node {
                                 notary_fee,
                                 None,
                                 timeout_slots,
+                                kora.as_ref(),
                             )
                             .await
                             {

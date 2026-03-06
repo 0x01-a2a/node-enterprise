@@ -1,6 +1,6 @@
 {
   "name": "@zerox1/sdk-linux-x64",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "description": "zerox1-node binary for Linux x64",
   "os": [
     "linux"
