@@ -9177,7 +9177,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-aggregator"
-version = "0.2.16"
+version = "0.2.18"
 dependencies = [
  "anyhow",
  "axum",
@@ -9204,7 +9204,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-challenger"
-version = "0.1.0"
+version = "0.2.18"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9226,7 +9226,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-node"
-version = "0.2.16"
+version = "0.2.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9261,7 +9261,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-protocol"
-version = "0.2.16"
+version = "0.2.18"
 dependencies = [
  "bytes",
  "ciborium",
@@ -9276,7 +9276,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-sati-client"
-version = "0.2.16"
+version = "0.2.18"
 dependencies = [
  "anyhow",
  "serde",
@@ -9292,7 +9292,7 @@ dependencies = [
 
 [[package]]
 name = "zerox1-simulator"
-version = "0.2.16"
+version = "0.2.18"
 dependencies = [
  "clap",
  "rand 0.8.5",

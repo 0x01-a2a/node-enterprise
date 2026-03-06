@@ -314,7 +314,7 @@ impl Zx01Node {
                         );
                     }
                     let api = self.api.clone();
-                    tokio::spawn(crate::api::serve(api, addr));
+                    tokio::spawn(crate::api::serve(api, addr, self.config.api_cors_origins.clone()));
                 }
                 Err(e) => tracing::warn!("Invalid --api-addr '{addr_str}': {e}"),
             }

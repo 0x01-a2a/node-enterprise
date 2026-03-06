@@ -186,6 +186,10 @@ const MAX_API_SENDS_PER_MINUTE: u32 = 120;
 /// Maximum `/registry/8004/register-prepare` requests per 60-second window.
 /// Each request makes an external Solana RPC call, so cap tightly.
 const MAX_REGISTRY_PREPARE_PER_MINUTE: u32 = 10;
+/// Maximum `/registry/8004/register-submit` requests per 60-second window.
+const MAX_REGISTRY_SUBMIT_PER_MINUTE: u32 = 20;
+/// Maximum `/hosted/send` requests per 60-second window.
+const MAX_HOSTED_SENDS_PER_MINUTE: u32 = 120;
 
 // USDC sweep constants
 const USDC_MINT_DEVNET: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
@@ -276,6 +280,10 @@ struct ApiInner {
     hosted_register_rate_limit: Mutex<RateLimitWindow>,
     /// Global rate limit window for `/registry/8004/register-prepare`.
     registry_prepare_rate_limit: Mutex<RateLimitWindow>,
+    /// Global rate limit window for `/registry/8004/register-submit`.
+    registry_submit_rate_limit: Mutex<RateLimitWindow>,
+    /// Global rate limit window for `/hosted/send`.
+    hosted_send_rate_limit: Mutex<RateLimitWindow>,
 
     // 8004 registry helpers
     /// Solana RPC URL — used by registry endpoints for blockhash + broadcast.
@@ -356,6 +364,14 @@ impl ApiState {
                 count: 0,
             }),
             registry_prepare_rate_limit: Mutex::new(RateLimitWindow {
+                window_start: now_secs(),
+                count: 0,
+            }),
+            registry_submit_rate_limit: Mutex::new(RateLimitWindow {
+                window_start: now_secs(),
+                count: 0,
+            }),
+            hosted_send_rate_limit: Mutex::new(RateLimitWindow {
                 window_start: now_secs(),
                 count: 0,
             }),
@@ -478,7 +494,7 @@ impl ApiState {
 // Server
 // ============================================================================
 
-pub async fn serve(state: ApiState, addr: SocketAddr) {
+pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>) {
     let router = Router::new()
         // Visualization
         .route("/ws/events", get(ws_events_handler))
@@ -503,24 +519,25 @@ pub async fn serve(state: ApiState, addr: SocketAddr) {
         // Admin — exempt agent management (loopback only; requires api_secret)
         .route("/admin/exempt", get(admin_exempt_list).post(admin_exempt_add))
         .route("/admin/exempt/{agent_id}", delete(admin_exempt_remove))
-        .layer(
-            // INFO-2: Local API — only allow loopback origins (zeroclaw, React Native).
+        .layer({
+            let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
+                // Default: loopback only (zeroclaw, React Native WebView).
+                vec![
+                    "http://127.0.0.1".parse().expect("valid CORS origin"),
+                    "http://localhost".parse().expect("valid CORS origin"),
+                ]
+            } else {
+                cors_origins.iter().filter_map(|o| o.parse().ok()).collect()
+            };
             tower_http::cors::CorsLayer::new()
-                .allow_origin([
-                    "http://127.0.0.1"
-                        .parse::<axum::http::HeaderValue>()
-                        .expect("hardcoded CORS origin '127.0.0.1' failed to parse"),
-                    "http://localhost"
-                        .parse::<axum::http::HeaderValue>()
-                        .expect("hardcoded CORS origin 'localhost' failed to parse"),
-                ])
+                .allow_origin(origins)
                 .allow_methods([
                     axum::http::Method::GET,
                     axum::http::Method::POST,
                     axum::http::Method::DELETE,
                 ])
-                .allow_headers(tower_http::cors::Any),
-        )
+                .allow_headers(tower_http::cors::Any)
+        })
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -910,6 +927,23 @@ async fn hosted_send(
             )
         }
     };
+
+    // Rate limit: cap hosted sends to prevent mesh spam if a token is compromised.
+    {
+        let now = now_secs();
+        let mut rl = state.0.hosted_send_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
+        if rl.count >= MAX_HOSTED_SENDS_PER_MINUTE {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })),
+            );
+        }
+        rl.count += 1;
+    }
 
     // Parse msg_type.
     let msg_type = match parse_msg_type(&req.msg_type) {
@@ -1405,8 +1439,14 @@ async fn registry_8004_register_prepare(
         rl.count += 1;
     }
 
-    // Validate agent_uri: reject control characters and C0/C1 chars that could
-    // cause log injection or confuse on-chain metadata parsers.
+    // Validate agent_uri: must be non-empty, bounded, and free of control chars.
+    if req.agent_uri.is_empty() || req.agent_uri.len() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "agent_uri must be 1–256 characters" })),
+        )
+            .into_response();
+    }
     if req.agent_uri.chars().any(|c| c.is_control()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1496,6 +1536,24 @@ async fn registry_8004_register_submit(
 ) -> Response {
     if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
         return resp;
+    }
+
+    // Rate limit: each submit triggers signature validation + RPC broadcast.
+    {
+        let now = now_secs();
+        let mut rl = state.0.registry_submit_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
+        if rl.count >= MAX_REGISTRY_SUBMIT_PER_MINUTE {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })),
+            )
+                .into_response();
+        }
+        rl.count += 1;
     }
 
     // Decode and validate the owner signature.

@@ -114,18 +114,25 @@ async fn main() -> anyhow::Result<()> {
 
     let mut keypair_signer: Option<Keypair> = None;
     if cli.auto_submit {
-        if let Some(ref path) = cli.keypair {
-            tracing::info!(
-                "Auto-submit enabled. Loading keypair from {}",
-                path.display()
-            );
-            keypair_signer = Some(
-                read_keypair_file(path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read keypair: {}", e))?,
-            );
-        } else {
-            tracing::error!("--auto-submit requires --keypair path");
-            std::process::exit(1);
+        match &cli.keypair {
+            None => {
+                tracing::error!("--auto-submit requires --keypair path");
+                std::process::exit(1);
+            }
+            Some(path) => {
+                if !path.exists() {
+                    tracing::error!("Keypair file not found: {}", path.display());
+                    std::process::exit(1);
+                }
+                tracing::info!(
+                    "Auto-submit enabled. Loading keypair from {}",
+                    path.display()
+                );
+                keypair_signer = Some(
+                    read_keypair_file(path)
+                        .map_err(|e| anyhow::anyhow!("Failed to read keypair: {}", e))?,
+                );
+            }
         }
     }
 

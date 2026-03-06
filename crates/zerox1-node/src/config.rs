@@ -87,6 +87,13 @@ pub struct Config {
     #[arg(long, env = "ZX01_API_READ_KEYS", value_delimiter = ',')]
     pub api_read_keys: Vec<String>,
 
+    /// Comma-separated allowed CORS origins for the API server.
+    /// Defaults to http://127.0.0.1 and http://localhost when unset.
+    /// Set this when serving a web UI from a non-loopback origin.
+    /// Example: "https://app.0x01.world,http://localhost:3000"
+    #[arg(long, env = "ZX01_API_CORS_ORIGINS", value_delimiter = ',')]
+    pub api_cors_origins: Vec<String>,
+
     /// USDC SPL token mint address (base58).
     /// Required for inactivity slash enforcement — enables the node to receive
     /// slash bounties into its USDC ATA.

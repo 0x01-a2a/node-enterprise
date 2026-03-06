@@ -176,12 +176,12 @@ pub async fn ingest_envelope(
 ) -> impl IntoResponse {
     // Authenticate ingest requests when a secret is configured.
     if let Some(ref secret) = state.ingest_secret {
-        let expected = format!("Bearer {secret}");
         let provided = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
             .unwrap_or("");
-        if !ct_eq(provided, &expected) {
+        if !ct_eq(provided, secret.as_str()) {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "unauthorized" })),
