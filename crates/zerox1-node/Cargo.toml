@@ -44,4 +44,5 @@ tower-http = { workspace = true }
 
 [features]
 devnet = []
-trade = []
+trade  = []
+bags   = ["trade"]

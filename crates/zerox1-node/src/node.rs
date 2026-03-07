@@ -156,7 +156,7 @@ impl Zx01Node {
         mut config: Config,
         identity: AgentIdentity,
         bootstrap_peers: Vec<libp2p::Multiaddr>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         // If no name was configured, derive one from the first 4 bytes of the
         // agent ID (8 hex chars) so every node has a unique, stable default.
         if config.agent_name.is_empty() {
@@ -218,6 +218,48 @@ impl Zx01Node {
 
         let exempt_agents = std::sync::Arc::new(std::sync::RwLock::new(exempt_set));
 
+        // ── Bags fee-sharing: resolve distribution address at startup ─────────
+        #[cfg(feature = "bags")]
+        let bags_config: Option<std::sync::Arc<crate::bags::BagsConfig>> = {
+            use std::str::FromStr as _;
+            if config.bags_fee_bps == 0 {
+                None
+            } else {
+                if config.bags_fee_bps > 500 {
+                    anyhow::bail!(
+                        "--bags-fee-bps {} exceeds maximum allowed value of 500 (5%)",
+                        config.bags_fee_bps
+                    );
+                }
+                let distribution_wallet = if let Some(ref w) = config.bags_wallet {
+                    solana_sdk::pubkey::Pubkey::from_str(w)
+                        .map_err(|e| anyhow::anyhow!("Invalid --bags-wallet '{w}': {e}"))?
+                } else {
+                    let api_client = crate::bags::BagsApiClient::new(
+                        config.bags_api_url.clone(),
+                        http_client.clone(),
+                    )?;
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current()
+                            .block_on(api_client.resolve_distribution_address())
+                    })
+                    .map_err(|e| anyhow::anyhow!(
+                        "Bags API unavailable and --bags-wallet not set: {e}"
+                    ))?
+                };
+                tracing::info!(
+                    "Bags fee-sharing enabled: {} bps → {}",
+                    config.bags_fee_bps,
+                    distribution_wallet
+                );
+                Some(std::sync::Arc::new(crate::bags::BagsConfig {
+                    fee_bps: config.bags_fee_bps,
+                    distribution_wallet,
+                    min_fee_micro: 1_000,
+                }))
+            }
+        };
+
         let (api, outbound_rx, hosted_outbound_rx) = ApiState::new(
             identity.agent_id,
             config.agent_name.clone(),
@@ -231,6 +273,8 @@ impl Zx01Node {
             kora.clone(),
             std::sync::Arc::clone(&exempt_agents),
             exempt_persist_path,
+            #[cfg(feature = "bags")]
+            bags_config,
         );
 
         // Load portfolio history from disk
@@ -263,7 +307,7 @@ impl Zx01Node {
             tracing::info!("No --kora-url set — on-chain transactions require SOL for gas.");
         }
 
-        Self {
+        Ok(Self {
             config,
             identity,
             peer_states: PeerStateMap::new(),
@@ -295,7 +339,7 @@ impl Zx01Node {
             registry8004,
             reg8004_failures: HashMap::new(),
             exempt_agents,
-        }
+        })
     }
 
     // ========================================================================

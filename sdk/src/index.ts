@@ -244,6 +244,8 @@ export const DEFAULT_SWAP_WHITELIST: ReadonlySet<string> = new Set([
   '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',
   // WIF
   'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
+  // BAGS — mainnet
+  'Bags4uLBdNscWBnHmqBozrjSScnEqPx5qZBzLiqnRVN7',
 ])
 
 export interface SwapParams {

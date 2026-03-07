@@ -155,6 +155,12 @@ pub enum PortfolioEvent {
         conversation_id: String,
         timestamp: u64,
     },
+    #[cfg(feature = "bags")]
+    BagsFee {
+        amount_usdc: f64,
+        txid: String,
+        timestamp: u64,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -259,6 +265,10 @@ pub struct EscrowApproveRequest {
     pub conversation_id: String,
     /// Optional hex-encoded 32-byte notary agent_id (defaults to self).
     pub notary: Option<String>,
+    /// Settlement amount in USDC microunits — used by Bags fee-sharing to compute
+    /// the routing cut. Optional so existing callers without this field still work.
+    #[cfg_attr(not(feature = "bags"), allow(dead_code))]
+    pub amount_usdc_micro: Option<u64>,
 }
 
 // (Removed duplicate PortfolioBalances)
@@ -309,9 +319,9 @@ const MAX_REGISTRY_SUBMIT_PER_MINUTE: u32 = 20;
 const MAX_HOSTED_SENDS_PER_MINUTE: u32 = 120;
 
 // USDC sweep constants
-const USDC_MINT_DEVNET: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
-const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub(crate) const USDC_MINT_DEVNET: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+pub(crate) const USDC_MINT_MAINNET: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub(crate) const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const SPL_ATA_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bJo";
 /// Minimum balance (atomic USDC units, 6 decimals) required to attempt a sweep.
 const MIN_SWEEP_AMOUNT: u64 = 10_000;
@@ -408,9 +418,9 @@ pub struct ApiInner {
     /// Node's own Ed25519 signing key — used for /wallet/sweep.
     pub node_signing_key: Arc<SigningKey>,
     /// Shared HTTP client for registry RPC calls.
-    http_client: reqwest::Client,
+    pub(crate) http_client: reqwest::Client,
     /// Whether this node is pointed at mainnet-beta (affects 8004 program IDs).
-    is_mainnet: bool,
+    pub(crate) is_mainnet: bool,
     /// Kora paymaster client — present when --kora-url is configured.
     pub kora: Option<KoraClient>,
     /// Optional override for the 8004 base collection (required on mainnet).
@@ -426,6 +436,10 @@ pub struct ApiInner {
     // Portfolio state
     pub portfolio_history: RwLock<PortfolioHistory>,
     portfolio_persist_path: PathBuf,
+
+    // Bags fee-sharing (feature = "bags")
+    #[cfg(feature = "bags")]
+    pub bags_config: Option<Arc<crate::bags::BagsConfig>>,
 }
 
 /// Cheaply cloneable shared state passed to all axum handlers.
@@ -455,6 +469,7 @@ impl ApiState {
         kora: Option<KoraClient>,
         exempt_agents: Arc<std::sync::RwLock<HashSet<[u8; 32]>>>,
         exempt_persist_path: PathBuf,
+        #[cfg(feature = "bags")] bags_config: Option<Arc<crate::bags::BagsConfig>>,
     ) -> (
         Self,
         mpsc::Receiver<OutboundRequest>,
@@ -511,6 +526,8 @@ impl ApiState {
             exempt_persist_path,
             portfolio_history: RwLock::new(PortfolioHistory::default()),
             portfolio_persist_path: PathBuf::new(), // to be set in load_or_init
+            #[cfg(feature = "bags")]
+            bags_config,
         }));
 
         (state, outbound_rx, hosted_outbound_rx)
@@ -697,6 +714,10 @@ pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>)
     let router = router
         .route("/portfolio/history", get(portfolio_history))
         .route("/portfolio/balances", get(portfolio_balances));
+
+    #[cfg(feature = "bags")]
+    let router = router
+        .route("/bags/config", get(bags_config_handler));
 
     let app = router.layer({
             let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
@@ -2229,7 +2250,7 @@ pub(crate) struct SweepRequest {
 /// Convert an ed25519_dalek SigningKey to a solana_sdk Keypair.
 ///
 /// solana_sdk::signature::Keypair is a 64-byte keypair: [secret(32) || public(32)].
-fn to_solana_keypair(sk: &SigningKey) -> solana_sdk::signature::Keypair {
+pub(crate) fn to_solana_keypair(sk: &SigningKey) -> solana_sdk::signature::Keypair {
     let mut bytes = [0u8; 64];
     bytes[..32].copy_from_slice(&sk.to_bytes());
     bytes[32..].copy_from_slice(sk.verifying_key().as_bytes());
@@ -2237,7 +2258,7 @@ fn to_solana_keypair(sk: &SigningKey) -> solana_sdk::signature::Keypair {
 }
 
 /// Derive the Associated Token Account address for a given owner and mint.
-fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+pub(crate) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     let spl_token: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().expect("valid SPL_TOKEN_PROGRAM_ID");
     let ata_program: Pubkey = SPL_ATA_PROGRAM_ID.parse().expect("valid SPL_ATA_PROGRAM_ID");
     Pubkey::find_program_address(
@@ -2247,10 +2268,6 @@ fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
-/// POST /wallet/sweep
-///
-/// Transfers USDC from the node's hot wallet ATA to `destination`.
-/// The destination must be a base58-encoded Solana wallet (not an ATA — the
 // ============================================================================
 // Escrow handlers
 // ============================================================================
@@ -2392,7 +2409,36 @@ async fn escrow_approve(
     )
     .await
     {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Ok(()) => {
+            #[cfg(feature = "bags")]
+            if let Some(bags) = state.0.bags_config.as_ref() {
+                if let Some(amount_micro) = req.amount_usdc_micro {
+                    let fee = ((amount_micro as u128 * bags.fee_bps as u128) / 10_000) as u64;
+                    if fee >= bags.min_fee_micro {
+                        let bags = bags.clone();
+                        let sk = state.0.node_signing_key.clone();
+                        let rpc = state.0.rpc_url.clone();
+                        let client = state.0.http_client.clone();
+                        let mainnet = state.0.is_mainnet;
+                        let state2 = state.clone();
+                        tokio::spawn(async move {
+                            match crate::bags::distribute_fee(sk, fee, &bags, &rpc, &client, mainnet).await {
+                                Ok(txid) => {
+                                    tracing::info!("Bags escrow fee distributed: {txid} ({fee} micro)");
+                                    state2.record_portfolio_event(PortfolioEvent::BagsFee {
+                                        amount_usdc: fee as f64 / 1_000_000.0,
+                                        txid,
+                                        timestamp: now_secs(),
+                                    }).await;
+                                }
+                                Err(e) => tracing::warn!("Bags escrow fee distribution failed: {e}"),
+                            }
+                        });
+                    }
+                }
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
     }
 }
@@ -2906,3 +2952,33 @@ pub async fn portfolio_balances(
     Ok(Json(PortfolioBalances { tokens }))
 }
 
+
+// ============================================================================
+// Bags fee-sharing config endpoint (feature = "bags")
+// ============================================================================
+
+#[cfg(feature = "bags")]
+async fn bags_config_handler(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
+        return resp;
+    }
+    match state.0.bags_config.as_ref() {
+        None => Json(serde_json::json!({
+            "enabled": false,
+            "fee_bps": 0,
+            "distribution_wallet": null,
+            "min_fee_micro": 0,
+        }))
+        .into_response(),
+        Some(cfg) => Json(serde_json::json!({
+            "enabled": true,
+            "fee_bps": cfg.fee_bps,
+            "distribution_wallet": cfg.distribution_wallet.to_string(),
+            "min_fee_micro": cfg.min_fee_micro,
+        }))
+        .into_response(),
+    }
+}

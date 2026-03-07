@@ -2293,7 +2293,7 @@ impl ReputationStore {
                     let now = now_secs();
                     let cutoff = now.saturating_sub(3600);
                     let mut rl = self.feedback_rate_limit.lock().unwrap();
-                    let window = rl.entry(fb.sender.clone()).or_insert_with(VecDeque::new);
+                    let window = rl.entry(fb.sender.clone()).or_default();
                     // Evict timestamps older than 1 hour.
                     while window.front().map(|&t| t < cutoff).unwrap_or(false) {
                         window.pop_front();

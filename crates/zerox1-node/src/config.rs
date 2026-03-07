@@ -206,6 +206,24 @@ pub struct Config {
     /// Can be specified multiple times or as a comma-separated list. Used for infrastructure bots (like Guardian).
     #[arg(long, env = "ZX01_EXEMPT_AGENTS", value_delimiter = ',')]
     pub exempt_agents: Vec<String>,
+
+    /// Bags fee-sharing: basis points of each swap output / escrow settlement to
+    /// route to the Bags distribution contract. 0 = disabled. Max 500 (5%).
+    #[cfg(feature = "bags")]
+    #[arg(long, env = "ZX01_BAGS_FEE_BPS", default_value_t = 0)]
+    pub bags_fee_bps: u16,
+
+    /// Bags distribution wallet (base58 Solana pubkey).
+    /// If omitted, the address is resolved from the Bags API at startup.
+    #[cfg(feature = "bags")]
+    #[arg(long, env = "ZX01_BAGS_WALLET")]
+    pub bags_wallet: Option<String>,
+
+    /// Bags API base URL used to resolve the distribution wallet when
+    /// --bags-wallet is not set.
+    #[cfg(feature = "bags")]
+    #[arg(long, env = "ZX01_BAGS_API_URL", default_value = "https://api.bags.fm")]
+    pub bags_api_url: String,
 }
 
 impl Config {

@@ -76,6 +76,8 @@ const SWAP_WHITELIST: &[&str] = &[
     "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
     // WIF
     "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    // BAGS — mainnet
+    "Bags4uLBdNscWBnHmqBozrjSScnEqPx5qZBzLiqnRVN7",
 ];
 
 fn is_whitelisted(mint: &str) -> bool {
@@ -143,10 +145,10 @@ pub async fn trade_swap_handler(
         return err_resp(StatusCode::BAD_REQUEST, "mints must differ".into());
     }
     if !is_whitelisted(&req.input_mint) {
-        return err_resp(StatusCode::BAD_REQUEST, format!("input_mint {} is not in the swap whitelist", req.input_mint).into());
+        return err_resp(StatusCode::BAD_REQUEST, format!("input_mint {} is not in the swap whitelist", req.input_mint));
     }
     if !is_whitelisted(&req.output_mint) {
-        return err_resp(StatusCode::BAD_REQUEST, format!("output_mint {} is not in the swap whitelist", req.output_mint).into());
+        return err_resp(StatusCode::BAD_REQUEST, format!("output_mint {} is not in the swap whitelist", req.output_mint));
     }
     if req.amount == 0 {
         return err_resp(StatusCode::BAD_REQUEST, "amount must be > 0".into());
@@ -253,7 +255,7 @@ pub async fn trade_swap_handler(
             }
         }
         
-        let tx_b64 = B64.encode(&bincode::serialize(&versioned_tx).unwrap());
+        let tx_b64 = B64.encode(bincode::serialize(&versioned_tx).unwrap());
         match kora.sign_and_send(&tx_b64).await {
             Ok(s) => s, 
             Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("Kora send failed: {e}")),
@@ -269,7 +271,43 @@ pub async fn trade_swap_handler(
         }
     };
 
-    // 5. Record event in portfolio history
+    // 5a. Bags fee-sharing: route a cut of the swap output to the Bags distribution wallet.
+    #[cfg(feature = "bags")]
+    if let Some(bags) = state.inner().bags_config.as_ref() {
+        // out_amount is in the output token's native units. Only apply when
+        // swapping to USDC so the fee is paid in a stable asset.
+        let is_usdc_output = req.output_mint == crate::api::USDC_MINT_MAINNET
+            || req.output_mint == crate::api::USDC_MINT_DEVNET;
+        if is_usdc_output {
+            let fee = ((out_amount as u128 * bags.fee_bps as u128) / 10_000) as u64;
+            if fee >= bags.min_fee_micro {
+                let bags = bags.clone();
+                let sk = state.inner().node_signing_key.clone();
+                let rpc = state.inner().rpc_url.clone();
+                let client = state.inner().http_client.clone();
+                let mainnet = state.inner().is_mainnet;
+                let state2 = state.clone();
+                tokio::spawn(async move {
+                    match crate::bags::distribute_fee(sk, fee, &bags, &rpc, &client, mainnet).await {
+                        Ok(txid) => {
+                            tracing::info!("Bags swap fee distributed: {txid} ({fee} micro)");
+                            state2.record_portfolio_event(PortfolioEvent::BagsFee {
+                                amount_usdc: fee as f64 / 1_000_000.0,
+                                txid,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            }).await;
+                        }
+                        Err(e) => tracing::warn!("Bags swap fee failed: {e}"),
+                    }
+                });
+            }
+        }
+    }
+
+    // 5b. Record swap event in portfolio history
     state.record_portfolio_event(PortfolioEvent::Swap {
         input_mint: req.input_mint.clone(),
         output_mint: req.output_mint.clone(),
