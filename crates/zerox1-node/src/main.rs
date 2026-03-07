@@ -14,6 +14,8 @@ mod node;
 mod peer_state;
 mod push_notary;
 mod registry_8004;
+#[cfg(feature = "trade")]
+pub mod trade;
 mod reputation;
 mod stake_lock;
 mod submit;

@@ -435,7 +435,8 @@ impl AgentReputation {
             1 => self.neutral_count += 1,
             _ => self.positive_count += 1,
         }
-        self.average_score = self.total_score as f64 / self.feedback_count as f64;
+        self.average_score = (self.total_score as f64 / self.feedback_count as f64)
+            .clamp(-100.0, 100.0);
         self.last_updated = now_secs();
     }
 
@@ -901,6 +902,17 @@ CREATE TABLE IF NOT EXISTS agent_latency (
 );
 CREATE INDEX IF NOT EXISTS idx_agent_latency_agent ON agent_latency(agent_id);
 ",
+    // v8: Unique constraint on (sender, conversation_id) to prevent duplicate feedback.
+    // Deduplicate first (keep the earliest row per pair), then create the unique index.
+    "
+DELETE FROM feedback_events
+WHERE id NOT IN (
+    SELECT MIN(id) FROM feedback_events
+    GROUP BY sender, conversation_id
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fe_sender_conv
+    ON feedback_events(sender, conversation_id);
+",
 ];
 
 struct Db(rusqlite::Connection);
@@ -1121,10 +1133,21 @@ impl Db {
         Ok(())
     }
 
-    /// Insert a raw feedback event.
+    /// Return true if a feedback row for this (sender, conversation_id) already exists.
+    fn feedback_exists(&self, sender: &str, conversation_id: &str) -> rusqlite::Result<bool> {
+        let count: i64 = self.0.query_row(
+            "SELECT COUNT(*) FROM feedback_events WHERE sender = ?1 AND conversation_id = ?2",
+            rusqlite::params![sender, conversation_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Insert a raw feedback event. Uses INSERT OR IGNORE so the (sender, conversation_id)
+    /// unique index silently drops duplicates without returning an error.
     fn insert_feedback(&self, fb: &FeedbackEvent, ts: u64) -> rusqlite::Result<()> {
         self.0.execute(
-            "INSERT INTO feedback_events
+            "INSERT OR IGNORE INTO feedback_events
                  (sender, target_agent, score, outcome, is_dispute, role,
                   conversation_id, slot, ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1834,6 +1857,8 @@ impl Db {
 
 /// In-memory cap for raw interactions when running without SQLite.
 const MAX_IN_MEMORY_INTERACTIONS: usize = 10_000;
+/// Max feedback submissions per sender per hour (sliding window, in-memory).
+const MAX_FEEDBACK_PER_HOUR: usize = 10;
 
 #[derive(Default)]
 struct Inner {
@@ -1925,6 +1950,9 @@ pub struct ReputationStore {
     /// Accepted ownership claims: agent_id → human wallet (base58), claimed_at.
     /// Set when the human calls POST /agents/:id/claim-owner.
     ownership_claimed: Arc<Mutex<HashMap<String, OwnerRecord>>>,
+    /// Per-sender sliding window of feedback timestamps (last 1 hour).
+    /// Used to rate-limit feedback submissions to MAX_FEEDBACK_PER_HOUR per sender.
+    feedback_rate_limit: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
 }
 
 impl Default for ReputationStore {
@@ -1939,6 +1967,7 @@ impl Default for ReputationStore {
             pending_messages: Arc::new(Mutex::new(HashMap::new())),
             ownership_pending: Arc::new(Mutex::new(HashMap::new())),
             ownership_claimed: Arc::new(Mutex::new(HashMap::new())),
+            feedback_rate_limit: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -2026,18 +2055,19 @@ impl ReputationStore {
             pending_messages: Arc::new(Mutex::new(HashMap::new())),
             ownership_pending: Arc::new(Mutex::new(ownership_pending)),
             ownership_claimed: Arc::new(Mutex::new(ownership_claimed)),
+            feedback_rate_limit: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    /// Return a reputation score for an agent, or 0 if unknown.
-    pub fn get_agent_reputation_score(&self, agent_id: &str) -> i64 {
+    /// Return the average reputation score for an agent, or 0.0 if unknown.
+    pub fn get_agent_reputation_score(&self, agent_id: &str) -> f64 {
         self.inner
             .read()
             .unwrap()
             .agents
             .get(agent_id)
-            .map(|r| r.total_score)
-            .unwrap_or(0)
+            .map(|r| r.average_score)
+            .unwrap_or(0.0)
     }
 
     /// Return true if the agent has a claimed owner.
@@ -2222,6 +2252,60 @@ impl ReputationStore {
                         &fb.target_agent
                     );
                     return None;
+                }
+                if !is_valid_agent_id(&fb.sender) {
+                    tracing::warn!(
+                        "Ingest: invalid sender '{}' — dropped",
+                        &fb.sender
+                    );
+                    return None;
+                }
+                if fb.sender == fb.target_agent {
+                    tracing::warn!(
+                        "Ingest: self-feedback from '{}' — dropped",
+                        &fb.sender
+                    );
+                    return None;
+                }
+                // DB dedup check: if (sender, conversation_id) already exists in SQLite,
+                // this is a replayed or duplicate event — skip to avoid double-counting.
+                {
+                    let db = self.db.lock().unwrap();
+                    if let Some(ref conn) = *db {
+                        match conn.feedback_exists(&fb.sender, &fb.conversation_id) {
+                            Ok(true) => {
+                                tracing::debug!(
+                                    "Ingest: duplicate feedback ({}, {}) — dropped",
+                                    &fb.sender,
+                                    &fb.conversation_id
+                                );
+                                return None;
+                            }
+                            Err(e) => {
+                                tracing::warn!("Ingest: feedback_exists query failed: {e}");
+                            }
+                            Ok(false) => {}
+                        }
+                    }
+                }
+                // Rate limit: max MAX_FEEDBACK_PER_HOUR per sender per hour.
+                {
+                    let now = now_secs();
+                    let cutoff = now.saturating_sub(3600);
+                    let mut rl = self.feedback_rate_limit.lock().unwrap();
+                    let window = rl.entry(fb.sender.clone()).or_insert_with(VecDeque::new);
+                    // Evict timestamps older than 1 hour.
+                    while window.front().map(|&t| t < cutoff).unwrap_or(false) {
+                        window.pop_front();
+                    }
+                    if window.len() >= MAX_FEEDBACK_PER_HOUR {
+                        tracing::warn!(
+                            "Ingest: rate limit exceeded for sender '{}' — dropped",
+                            &fb.sender
+                        );
+                        return None;
+                    }
+                    window.push_back(now);
                 }
                 let rep = inner
                     .agents

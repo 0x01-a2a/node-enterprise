@@ -55,6 +55,7 @@ pub fn build_register_tx(
     recent_blockhash: Hash,
     is_mainnet: bool,
     collection_override: Option<Pubkey>,
+    fee_payer_override: Option<Pubkey>,
 ) -> anyhow::Result<RegisterPrepared> {
     let program_id: Pubkey = if is_mainnet {
         PROGRAM_ID_MAINNET.parse().expect("hardcoded mainnet program id")
@@ -113,8 +114,9 @@ pub fn build_register_tx(
         data,
     };
 
-    // Build transaction — owner is the fee payer.
-    let mut tx = Transaction::new_with_payer(&[instruction], Some(&owner_pubkey));
+    // Build transaction. If fee_payer_override is provided, use it. Otherwise owner is fee payer.
+    let fee_payer = fee_payer_override.unwrap_or(owner_pubkey);
+    let mut tx = Transaction::new_with_payer(&[instruction], Some(&fee_payer));
     // Pre-sign with the asset keypair; owner signs externally.
     tx.partial_sign(&[&asset_kp], recent_blockhash);
 

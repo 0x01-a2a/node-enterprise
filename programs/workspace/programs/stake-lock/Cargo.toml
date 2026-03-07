@@ -14,6 +14,7 @@ cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
+localtest = []
 idl-build = ["anchor-lang/idl-build"]
 
 [dependencies]

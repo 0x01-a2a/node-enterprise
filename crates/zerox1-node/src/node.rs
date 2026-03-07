@@ -27,8 +27,8 @@ use solana_sdk::pubkey::Pubkey;
 
 use crate::{
     api::{
-        ApiEvent, ApiState, BatchSnapshot, OutboundRequest, PeerSnapshot, ReputationSnapshot,
-        SentConfirmation,
+        ApiEvent, ApiState, BatchSnapshot, OutboundRequest, PeerSnapshot, PortfolioEvent,
+        ReputationSnapshot, SentConfirmation,
     },
     batch::{current_epoch, now_micros, BatchAccumulator},
     config::Config,
@@ -232,6 +232,11 @@ impl Zx01Node {
             std::sync::Arc::clone(&exempt_agents),
             exempt_persist_path,
         );
+
+        // Load portfolio history from disk
+        let portfolio_path = config.log_dir.join("portfolio_history.json");
+        let _ = tokio::runtime::Handle::current().block_on(api.load_portfolio_history(portfolio_path));
+
         let batch = BatchAccumulator::new(epoch, 0);
         let logger = EnvelopeLogger::new(log_dir, epoch);
 
@@ -1412,7 +1417,7 @@ impl Zx01Node {
         self.api.push_inbound(&env, self.current_slot);
 
         match env.msg_type {
-            MsgType::Propose | MsgType::Counter => {
+            MsgType::Propose => {
                 // Convention: first 16 bytes of payload = LE i128 bid amount.
                 let bid_value: i128 = if env.payload.len() >= BID_VALUE_LEN {
                     i128::from_le_bytes(env.payload[..BID_VALUE_LEN].try_into().unwrap())
@@ -1425,6 +1430,35 @@ impl Zx01Node {
                     bid_value,
                     slot: self.current_slot,
                 });
+            }
+            MsgType::Counter => {
+                // Same bid extraction as PROPOSE — the counter-offered amount
+                // is in the first 16 bytes of the payload.
+                let bid_value: i128 = if env.payload.len() >= BID_VALUE_LEN {
+                    i128::from_le_bytes(env.payload[..BID_VALUE_LEN].try_into().unwrap())
+                } else {
+                    0
+                };
+                self.batch.add_bid(TypedBid {
+                    conversation_id: env.conversation_id,
+                    counterparty: env.sender,
+                    bid_value,
+                    slot: self.current_slot,
+                });
+                tracing::info!(
+                    "COUNTER from {} for conversation {} (bid={})",
+                    hex::encode(env.sender),
+                    hex::encode(env.conversation_id),
+                    bid_value,
+                );
+                self.push_to_aggregator(serde_json::json!({
+                    "msg_type":        "COUNTER",
+                    "sender":          hex::encode(env.sender),
+                    "recipient":       hex::encode(env.recipient),
+                    "conversation_id": hex::encode(env.conversation_id),
+                    "bid_value":       bid_value,
+                    "slot":            self.current_slot,
+                }));
             }
             MsgType::Accept => {
                 self.batch.record_accept(TaskSelection {
@@ -1583,6 +1617,26 @@ impl Zx01Node {
                         slot: self.current_slot,
                         sati_attestation_hash: [0u8; 32],
                     });
+
+                    // Record bounty in portfolio if positive score
+                    if fb.score > 0 {
+                        let api = self.api.clone();
+                        let from = env.sender;
+                        let cid = hex::encode(fb.conversation_id);
+                        let score = fb.score;
+                        tokio::spawn(async move {
+                            api.record_portfolio_event(PortfolioEvent::Bounty {
+                                amount_usdc: score as f64 / 10.0, // 10 score = $1.00
+                                from_agent: hex::encode(from),
+                                conversation_id: cid,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                            })
+                            .await;
+                        });
+                    }
                 }
             }
             Err(e) => tracing::debug!("FEEDBACK payload parse failed: {e}"),
@@ -1744,16 +1798,6 @@ impl Zx01Node {
     // ========================================================================
 
     async fn handle_outbound(&mut self, swarm: &mut Swarm<Zx01Behaviour>, req: OutboundRequest) {
-        // Save bid value before payload is moved into build_envelope (needed for GAP-3 escrow lock).
-        let accept_bid_value: Option<u64> = if req.msg_type == MsgType::Accept
-            && req.payload.len() >= BID_VALUE_LEN
-        {
-            let v = i128::from_le_bytes(req.payload[..BID_VALUE_LEN].try_into().unwrap());
-            if v > 0 { Some(v as u64) } else { None }
-        } else {
-            None
-        };
-
         let env = self.build_envelope(
             req.msg_type,
             req.recipient,
@@ -1858,38 +1902,7 @@ impl Zx01Node {
                 // This populates batch.verifier_ids, making hv (GAP-04) non-None.
                 if req.msg_type == MsgType::Accept {
                     self.try_assign_notary(swarm, req.conversation_id);
-
-                    // GAP-3: Lock escrow funds now that we (requester) have accepted the bid.
-                    if let Some(amount) = accept_bid_value {
-                        let rpc_url = self.config.rpc_url.clone();
-                        let sk_bytes = self.identity.signing_key.to_bytes();
-                        let vk_bytes = self.identity.verifying_key.to_bytes();
-                        let provider_bytes = req.recipient;
-                        let conv_id = req.conversation_id;
-                        // 10% notary fee, 1000 slot timeout; notary assigned via try_assign_notary.
-                        let notary_fee = amount / 10;
-                        let timeout_slots = 1000_u64;
-                        let kora = self.kora.clone();
-                        tokio::spawn(async move {
-                            use solana_rpc_client::nonblocking::rpc_client::RpcClient as SolanaRpc;
-                            if let Err(e) = crate::escrow::lock_payment_onchain(
-                                &SolanaRpc::new(rpc_url),
-                                sk_bytes,
-                                vk_bytes,
-                                provider_bytes,
-                                conv_id,
-                                amount,
-                                notary_fee,
-                                None,
-                                timeout_slots,
-                                kora.as_ref(),
-                            )
-                            .await
-                            {
-                                tracing::warn!("Escrow lock_payment failed: {e}");
-                            }
-                        });
-                    }
+                    // Escrow lock is SDK-layer responsibility — called explicitly via POST /escrow/lock.
                 }
             }
             Err(e) => tracing::warn!("Outbound send failed: {e}"),
@@ -2191,6 +2204,7 @@ impl Zx01Node {
             self.kora.as_ref(),
             &usdc_mint,
             &agents,
+            &self.api,
         )
         .await;
     }

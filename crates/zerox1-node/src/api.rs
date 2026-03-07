@@ -10,6 +10,18 @@
 //!   POST /envelopes/send         — Send an envelope (node signs + routes)
 //!   GET  /ws/inbox               — WebSocket stream of inbound envelopes
 //!
+//! High-level negotiation (encode + send in one call):
+//!   POST /negotiate/propose      — Send PROPOSE with structured payload
+//!   POST /negotiate/counter      — Send COUNTER with structured payload
+//!   POST /negotiate/accept       — Send ACCEPT with agreed amount encoded
+//!   POST /hosted/negotiate/propose  — Same, for hosted agents (Bearer token)
+//!   POST /hosted/negotiate/counter  — Same, for hosted agents
+//!   POST /hosted/negotiate/accept   — Same, for hosted agents
+//!
+//! Escrow (explicit on-chain locking):
+//!   POST /escrow/lock            — Lock USDC in escrow (requester → provider)
+//!   POST /escrow/approve         — Approve and release locked payment
+//!
 //! 8004 Solana Agent Registry:
 //!   GET  /registry/8004/info              — Program IDs, collection, step-by-step guide
 //!   POST /registry/8004/register-prepare  — Build partially-signed tx (agent signs message_b64)
@@ -123,6 +135,34 @@ pub enum ApiEvent {
 }
 
 // ============================================================================
+// Portfolio types
+// ============================================================================
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PortfolioEvent {
+    Swap {
+        input_mint: String,
+        output_mint: String,
+        input_amount: f64,
+        output_amount: f64,
+        txid: String,
+        timestamp: u64,
+    },
+    Bounty {
+        amount_usdc: f64,
+        from_agent: String,
+        conversation_id: String,
+        timestamp: u64,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct PortfolioHistory {
+    pub events: Vec<PortfolioEvent>,
+}
+
+// ============================================================================
 // Agent integration types
 // ============================================================================
 
@@ -145,6 +185,83 @@ pub struct SentConfirmation {
     pub nonce: u64,
     pub payload_hash: String, // hex keccak256
 }
+
+// ── Negotiate endpoint types ──────────────────────────────────────────────
+
+/// Build the standard negotiate payload wire format:
+/// `[16-byte LE i128 amount_usdc_micro][JSON extra]`
+fn build_negotiate_payload(amount_usdc_micro: u64, extra: serde_json::Value) -> Vec<u8> {
+    let mut payload = (amount_usdc_micro as i128).to_le_bytes().to_vec();
+    payload.extend_from_slice(extra.to_string().as_bytes());
+    payload
+}
+
+/// Request body for POST /negotiate/propose (and /hosted/negotiate/propose).
+#[derive(Deserialize)]
+pub struct NegotiateProposeRequest {
+    pub recipient: String,
+    /// 16-byte hex conversation ID. Auto-generated if omitted.
+    pub conversation_id: Option<String>,
+    /// Bid amount in USDC microunits. Default: 0 (unspecified).
+    pub amount_usdc_micro: Option<u64>,
+    /// Max counter rounds (default: 2).
+    pub max_rounds: Option<u8>,
+    pub message: String,
+}
+
+/// Request body for POST /negotiate/counter (and /hosted/negotiate/counter).
+#[derive(Deserialize)]
+pub struct NegotiateCounterRequest {
+    pub recipient: String,
+    pub conversation_id: String,
+    pub amount_usdc_micro: u64,
+    pub round: u8,
+    pub max_rounds: Option<u8>,
+    pub message: Option<String>,
+}
+
+/// Request body for POST /negotiate/accept (and /hosted/negotiate/accept).
+#[derive(Deserialize)]
+pub struct NegotiateAcceptRequest {
+    pub recipient: String,
+    pub conversation_id: String,
+    pub amount_usdc_micro: u64,
+    pub message: Option<String>,
+}
+
+// ── Escrow endpoint types ─────────────────────────────────────────────────
+
+/// Request body for POST /escrow/lock.
+#[derive(Deserialize)]
+pub struct EscrowLockRequest {
+    /// Hex-encoded 32-byte agent_id of the provider (payment recipient).
+    pub provider: String,
+    /// Hex-encoded 16-byte conversation ID.
+    pub conversation_id: String,
+    /// Amount to lock in USDC microunits (e.g. 1_000_000 = 1 USDC).
+    pub amount_usdc_micro: u64,
+    /// Notary fee in USDC microunits. Default: amount / 10.
+    pub notary_fee: Option<u64>,
+    /// Solana slot timeout before provider can claim without approval. Default: 1000.
+    pub timeout_slots: Option<u64>,
+    /// Optional hex-encoded 32-byte agent_id of a designated notary.
+    pub notary: Option<String>,
+}
+
+/// Request body for POST /escrow/approve.
+#[derive(Deserialize)]
+pub struct EscrowApproveRequest {
+    /// Hex-encoded 32-byte agent_id of the requester (payer).
+    pub requester: String,
+    /// Hex-encoded 32-byte agent_id of the provider (payee).
+    pub provider: String,
+    /// Hex-encoded 16-byte conversation ID.
+    pub conversation_id: String,
+    /// Optional hex-encoded 32-byte notary agent_id (defaults to self).
+    pub notary: Option<String>,
+}
+
+// (Removed duplicate PortfolioBalances)
 
 /// Outbound request queued by POST /envelopes/send, consumed by the node loop.
 pub struct OutboundRequest {
@@ -247,7 +364,7 @@ pub struct HostedInboxQuery {
 // Shared API state
 // ============================================================================
 
-struct ApiInner {
+pub struct ApiInner {
     // Visualization state
     peers: RwLock<HashMap<[u8; 32], PeerSnapshot>>,
     reputation: RwLock<HashMap<[u8; 32], ReputationSnapshot>>,
@@ -269,7 +386,7 @@ struct ApiInner {
 
     // Hosted-agent state
     /// token (hex-32) → HostedSession
-    hosted_sessions: Arc<RwLock<HashMap<String, HostedSession>>>,
+    pub hosted_sessions: Arc<RwLock<HashMap<String, HostedSession>>>,
     #[allow(dead_code)]
     hosting_fee_bps: u32,
     /// Pre-signed envelopes from hosted-agent send handler → node loop.
@@ -287,15 +404,15 @@ struct ApiInner {
 
     // 8004 registry helpers
     /// Solana RPC URL — used by registry endpoints for blockhash + broadcast.
-    rpc_url: String,
+    pub rpc_url: String,
     /// Node's own Ed25519 signing key — used for /wallet/sweep.
-    node_signing_key: Arc<SigningKey>,
+    pub node_signing_key: Arc<SigningKey>,
     /// Shared HTTP client for registry RPC calls.
     http_client: reqwest::Client,
     /// Whether this node is pointed at mainnet-beta (affects 8004 program IDs).
     is_mainnet: bool,
     /// Kora paymaster client — present when --kora-url is configured.
-    kora: Option<KoraClient>,
+    pub kora: Option<KoraClient>,
     /// Optional override for the 8004 base collection (required on mainnet).
     registry_8004_collection: Option<String>,
     /// The current Solana slot, continuously updated by the node event loop.
@@ -305,6 +422,10 @@ struct ApiInner {
     exempt_agents: Arc<std::sync::RwLock<HashSet<[u8; 32]>>>,
     /// Path to persist exempt_agents across restarts (log_dir/exempt_agents.json).
     exempt_persist_path: PathBuf,
+
+    // Portfolio state
+    pub portfolio_history: RwLock<PortfolioHistory>,
+    portfolio_persist_path: PathBuf,
 }
 
 /// Cheaply cloneable shared state passed to all axum handlers.
@@ -312,6 +433,10 @@ struct ApiInner {
 pub struct ApiState(Arc<ApiInner>);
 
 impl ApiState {
+    #[cfg(feature = "trade")]
+    pub fn inner(&self) -> &ApiInner {
+        &self.0
+    }
     /// Create a new ApiState.
     ///
     /// Returns `(state, outbound_rx, hosted_outbound_rx)`. The caller (node)
@@ -384,9 +509,40 @@ impl ApiState {
             current_slot: core::sync::atomic::AtomicU64::new(0),
             exempt_agents,
             exempt_persist_path,
+            portfolio_history: RwLock::new(PortfolioHistory::default()),
+            portfolio_persist_path: PathBuf::new(), // to be set in load_or_init
         }));
 
         (state, outbound_rx, hosted_outbound_rx)
+    }
+
+    pub async fn load_portfolio_history(&self, path: PathBuf) -> anyhow::Result<()> {
+        let mut arc = Arc::clone(&self.0);
+        let inner = Arc::get_mut(&mut arc).expect("ApiInner unique ref for init");
+        inner.portfolio_persist_path = path.clone();
+
+        if path.exists() {
+            let data = std::fs::read_to_string(&path)?;
+            let history: PortfolioHistory = serde_json::from_str(&data)?;
+            *inner.portfolio_history.get_mut() = history;
+        }
+        Ok(())
+    }
+
+    pub async fn record_portfolio_event(&self, event: PortfolioEvent) {
+        let mut history = self.0.portfolio_history.write().await;
+        history.events.insert(0, event);
+        if history.events.len() > 1000 {
+            history.events.truncate(1000);
+        }
+
+        // Persist
+        let path = &self.0.portfolio_persist_path;
+        if !path.as_os_str().is_empty() {
+            if let Ok(json) = serde_json::to_string_pretty(&*history) {
+                let _ = std::fs::write(path, json);
+            }
+        }
     }
 
     // ── Visualization update helpers ─────────────────────────────────────────
@@ -505,21 +661,44 @@ pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>)
         // Agent integration
         .route("/envelopes/send", post(send_envelope))
         .route("/ws/inbox", get(ws_inbox_handler))
+        // High-level negotiate endpoints (encode + send)
+        .route("/negotiate/propose", post(negotiate_propose))
+        .route("/negotiate/counter", post(negotiate_counter))
+        .route("/negotiate/accept", post(negotiate_accept))
         // Hosted-agent API
         .route("/hosted/ping", get(hosted_ping))
         .route("/hosted/register", post(hosted_register))
         .route("/hosted/send", post(hosted_send))
+        .route("/hosted/negotiate/propose", post(hosted_negotiate_propose))
+        .route("/hosted/negotiate/counter", post(hosted_negotiate_counter))
+        .route("/hosted/negotiate/accept", post(hosted_negotiate_accept))
         .route("/ws/hosted/inbox", get(ws_hosted_inbox_handler))
         // 8004 Solana Agent Registry helpers
         .route("/registry/8004/info", get(registry_8004_info))
         .route("/registry/8004/register-prepare", post(registry_8004_register_prepare))
         .route("/registry/8004/register-submit", post(registry_8004_register_submit))
+        // Escrow
+        .route("/escrow/lock", post(escrow_lock))
+        .route("/escrow/approve", post(escrow_approve))
         // Hot wallet sweep
         .route("/wallet/sweep", post(sweep_usdc))
         // Admin — exempt agent management (loopback only; requires api_secret)
         .route("/admin/exempt", get(admin_exempt_list).post(admin_exempt_add))
-        .route("/admin/exempt/{agent_id}", delete(admin_exempt_remove))
-        .layer({
+        .route("/admin/exempt/{agent_id}", delete(admin_exempt_remove));
+
+    #[cfg(feature = "trade")]
+    let router = router
+        .route("/trade/swap", post(crate::trade::trade_swap_handler))
+        .route("/trade/quote", get(crate::trade::trade_quote_handler))
+        .route("/portfolio/history", get(portfolio_history))
+        .route("/portfolio/balances", get(portfolio_balances));
+
+    #[cfg(not(feature = "trade"))]
+    let router = router
+        .route("/portfolio/history", get(portfolio_history))
+        .route("/portfolio/balances", get(portfolio_balances));
+
+    let app = router.layer({
             let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
                 // Default: loopback only (zeroclaw, React Native WebView).
                 vec![
@@ -546,7 +725,7 @@ pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>)
 
     tracing::info!("API listening on http://{addr}");
 
-    axum::serve(listener, router)
+    axum::serve(listener, app)
         .await
         .expect("API server error");
 }
@@ -835,6 +1014,154 @@ async fn ws_inbox_task(mut socket: WebSocket, state: ApiState) {
 }
 
 // ============================================================================
+// Negotiate route handlers (local)
+// ============================================================================
+
+/// POST /negotiate/propose
+///
+/// Encodes amount + message into the standard negotiate wire format and sends
+/// a PROPOSE envelope. Conversation ID is auto-generated if not supplied.
+async fn negotiate_propose(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<NegotiateProposeRequest>,
+) -> impl IntoResponse {
+    if require_api_secret_or_unauthorized(&state, &headers).is_some() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+    }
+    {
+        let now = now_secs();
+        let mut rl = state.0.send_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if rl.count >= MAX_API_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+        }
+        rl.count += 1;
+    }
+    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+    };
+    let (conv_id_hex, conversation_id) = match req.conversation_id {
+        Some(ref s) => match hex::decode(s).ok().and_then(|b| b.try_into().ok()) {
+            Some(a) => (s.clone(), a),
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        },
+        None => { let b = rand::random::<[u8; 16]>(); (hex::encode(b), b) },
+    };
+    let amount = req.amount_usdc_micro.unwrap_or(0);
+    let max_rounds = req.max_rounds.unwrap_or(2);
+    let payload = build_negotiate_payload(amount, serde_json::json!({
+        "max_rounds": max_rounds,
+        "message": req.message,
+    }));
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let outbound = OutboundRequest { msg_type: MsgType::Propose, recipient, conversation_id, payload, reply: reply_tx };
+    if state.send_outbound(outbound).await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+    }
+    match reply_rx.await {
+        Ok(Ok(conf)) => (StatusCode::OK, Json(serde_json::json!({
+            "conversation_id": conv_id_hex,
+            "nonce": conf.nonce,
+            "payload_hash": conf.payload_hash,
+        }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "node loop dropped reply" }))),
+    }
+}
+
+/// POST /negotiate/counter
+async fn negotiate_counter(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<NegotiateCounterRequest>,
+) -> impl IntoResponse {
+    if require_api_secret_or_unauthorized(&state, &headers).is_some() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+    }
+    {
+        let now = now_secs();
+        let mut rl = state.0.send_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if rl.count >= MAX_API_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+        }
+        rl.count += 1;
+    }
+    let max_rounds = req.max_rounds.unwrap_or(2);
+    if req.round == 0 || req.round > max_rounds {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("round {} is out of range [1, {}]", req.round, max_rounds)
+        })));
+    }
+    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+    };
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+    };
+    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
+        "round": req.round,
+        "max_rounds": max_rounds,
+        "message": req.message.unwrap_or_default(),
+    }));
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let outbound = OutboundRequest { msg_type: MsgType::Counter, recipient, conversation_id, payload, reply: reply_tx };
+    if state.send_outbound(outbound).await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+    }
+    match reply_rx.await {
+        Ok(Ok(conf)) => (StatusCode::OK, Json(serde_json::to_value(conf).unwrap_or_default())),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "node loop dropped reply" }))),
+    }
+}
+
+/// POST /negotiate/accept
+async fn negotiate_accept(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<NegotiateAcceptRequest>,
+) -> impl IntoResponse {
+    if require_api_secret_or_unauthorized(&state, &headers).is_some() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+    }
+    {
+        let now = now_secs();
+        let mut rl = state.0.send_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if rl.count >= MAX_API_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+        }
+        rl.count += 1;
+    }
+    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+    };
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+    };
+    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
+        "message": req.message.unwrap_or_default(),
+    }));
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    let outbound = OutboundRequest { msg_type: MsgType::Accept, recipient, conversation_id, payload, reply: reply_tx };
+    if state.send_outbound(outbound).await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+    }
+    match reply_rx.await {
+        Ok(Ok(conf)) => (StatusCode::OK, Json(serde_json::to_value(conf).unwrap_or_default())),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "node loop dropped reply" }))),
+    }
+}
+
+// ============================================================================
 // Hosted-agent route handlers
 // ============================================================================
 
@@ -1090,6 +1417,185 @@ async fn hosted_send(
     (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
 }
 
+/// POST /hosted/negotiate/propose — `Authorization: Bearer <token>`.
+async fn hosted_negotiate_propose(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<NegotiateProposeRequest>,
+) -> impl IntoResponse {
+    let token = match resolve_hosted_token(&headers) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "missing Bearer token" }))),
+    };
+    {
+        let now = now_secs();
+        let mut rl = state.0.hosted_send_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if rl.count >= MAX_HOSTED_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })));
+        }
+        rl.count += 1;
+    }
+    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+    };
+    let (conv_id_hex, conversation_id) = match req.conversation_id {
+        Some(ref s) => match hex::decode(s).ok().and_then(|b| b.try_into().ok()) {
+            Some(a) => (s.clone(), a),
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        },
+        None => { let b = rand::random::<[u8; 16]>(); (hex::encode(b), b) },
+    };
+    let amount = req.amount_usdc_micro.unwrap_or(0);
+    let max_rounds = req.max_rounds.unwrap_or(2);
+    let payload = build_negotiate_payload(amount, serde_json::json!({
+        "max_rounds": max_rounds,
+        "message": req.message,
+    }));
+    let env = {
+        let now = now_secs();
+        let mut sessions = state.0.hosted_sessions.write().await;
+        let session = match sessions.get_mut(&token) {
+            Some(s) => s,
+            None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid token" }))),
+        };
+        if now.saturating_sub(session.created_at) >= SESSION_TTL_SECS {
+            sessions.remove(&token);
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "session expired" })));
+        }
+        if now.saturating_sub(session.rate_window_start) >= 60 { session.rate_window_start = now; session.sends_in_window = 0; }
+        session.sends_in_window += 1;
+        if session.sends_in_window > MAX_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+        }
+        session.nonce += 1;
+        Envelope::build(MsgType::Propose, session.agent_id, recipient, state.get_current_slot(), session.nonce, conversation_id, payload, &session.signing_key)
+    };
+    if state.send_hosted_outbound(env).await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "conversation_id": conv_id_hex })))
+}
+
+/// POST /hosted/negotiate/counter — `Authorization: Bearer <token>`.
+async fn hosted_negotiate_counter(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<NegotiateCounterRequest>,
+) -> impl IntoResponse {
+    let token = match resolve_hosted_token(&headers) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "missing Bearer token" }))),
+    };
+    {
+        let now = now_secs();
+        let mut rl = state.0.hosted_send_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if rl.count >= MAX_HOSTED_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })));
+        }
+        rl.count += 1;
+    }
+    let max_rounds = req.max_rounds.unwrap_or(2);
+    if req.round == 0 || req.round > max_rounds {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("round {} is out of range [1, {}]", req.round, max_rounds)
+        })));
+    }
+    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+    };
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+    };
+    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
+        "round": req.round,
+        "max_rounds": max_rounds,
+        "message": req.message.unwrap_or_default(),
+    }));
+    let env = {
+        let now = now_secs();
+        let mut sessions = state.0.hosted_sessions.write().await;
+        let session = match sessions.get_mut(&token) {
+            Some(s) => s,
+            None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid token" }))),
+        };
+        if now.saturating_sub(session.created_at) >= SESSION_TTL_SECS {
+            sessions.remove(&token);
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "session expired" })));
+        }
+        if now.saturating_sub(session.rate_window_start) >= 60 { session.rate_window_start = now; session.sends_in_window = 0; }
+        session.sends_in_window += 1;
+        if session.sends_in_window > MAX_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+        }
+        session.nonce += 1;
+        Envelope::build(MsgType::Counter, session.agent_id, recipient, state.get_current_slot(), session.nonce, conversation_id, payload, &session.signing_key)
+    };
+    if state.send_hosted_outbound(env).await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+    }
+    (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
+}
+
+/// POST /hosted/negotiate/accept — `Authorization: Bearer <token>`.
+async fn hosted_negotiate_accept(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<NegotiateAcceptRequest>,
+) -> impl IntoResponse {
+    let token = match resolve_hosted_token(&headers) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "missing Bearer token" }))),
+    };
+    {
+        let now = now_secs();
+        let mut rl = state.0.hosted_send_rate_limit.lock().await;
+        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if rl.count >= MAX_HOSTED_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })));
+        }
+        rl.count += 1;
+    }
+    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+    };
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+    };
+    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
+        "message": req.message.unwrap_or_default(),
+    }));
+    let env = {
+        let now = now_secs();
+        let mut sessions = state.0.hosted_sessions.write().await;
+        let session = match sessions.get_mut(&token) {
+            Some(s) => s,
+            None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid token" }))),
+        };
+        if now.saturating_sub(session.created_at) >= SESSION_TTL_SECS {
+            sessions.remove(&token);
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "session expired" })));
+        }
+        if now.saturating_sub(session.rate_window_start) >= 60 { session.rate_window_start = now; session.sends_in_window = 0; }
+        session.sends_in_window += 1;
+        if session.sends_in_window > MAX_SENDS_PER_MINUTE {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+        }
+        session.nonce += 1;
+        Envelope::build(MsgType::Accept, session.agent_id, recipient, state.get_current_slot(), session.nonce, conversation_id, payload, &session.signing_key)
+    };
+    if state.send_hosted_outbound(env).await.is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+    }
+    (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
+}
+
 /// GET /ws/hosted/inbox
 ///
 /// Opens a WebSocket and streams inbound envelopes addressed to the hosted
@@ -1220,7 +1726,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn require_api_secret_or_unauthorized(state: &ApiState, headers: &HeaderMap) -> Option<Response> {
+pub(crate) fn require_api_secret_or_unauthorized(state: &ApiState, headers: &HeaderMap) -> Option<Response> {
     let has_read_keys = !state.0.api_read_keys.is_empty();
     if let Some(ref secret) = state.0.api_secret {
         let provided = headers
@@ -1330,7 +1836,7 @@ fn require_read_or_master_ws(
 }
 
 /// Extract the Bearer token from an `Authorization: Bearer <token>` header.
-fn resolve_hosted_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn resolve_hosted_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1492,6 +1998,7 @@ async fn registry_8004_register_prepare(
         blockhash,
         state.0.is_mainnet,
         collection_override,
+        None, // fee_payer_override
     ) {
         Ok(prepared) => Json(serde_json::json!({
             "asset_pubkey":    prepared.asset_pubkey,
@@ -1716,6 +2223,7 @@ async fn registry_8004_register_submit(
 #[derive(Deserialize)]
 pub(crate) struct SweepRequest {
     destination: String,
+    amount: Option<u64>,
 }
 
 /// Convert an ed25519_dalek SigningKey to a solana_sdk Keypair.
@@ -1741,9 +2249,157 @@ fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
 
 /// POST /wallet/sweep
 ///
-/// Transfers all USDC from the node's hot wallet ATA to `destination`.
+/// Transfers USDC from the node's hot wallet ATA to `destination`.
 /// The destination must be a base58-encoded Solana wallet (not an ATA — the
+// ============================================================================
+// Escrow handlers
+// ============================================================================
+
+/// POST /escrow/lock
+///
+/// Locks USDC in the 0x01 escrow program on behalf of this node's agent
+/// (requester) to pay a provider for completing a task.
+///
+/// The node uses its own keypair to sign the Solana transaction.
+/// `amount_usdc_micro` must match the agreed amount from the ACCEPT payload.
+async fn escrow_lock(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<EscrowLockRequest>,
+) -> impl IntoResponse {
+    if require_api_secret_or_unauthorized(&state, &headers).is_some() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+    }
+
+    let provider_bytes: [u8; 32] = match hex::decode(&req.provider)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "provider: invalid hex or not 32 bytes" }))),
+    };
+
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+    };
+
+    let notary_pubkey: Option<solana_sdk::pubkey::Pubkey> = match req.notary {
+        Some(ref hex_str) => match hex::decode(hex_str).ok().and_then(|b| b.try_into().ok()) {
+            Some(bytes) => Some(solana_sdk::pubkey::Pubkey::new_from_array(bytes)),
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "notary: invalid hex or not 32 bytes" }))),
+        },
+        None => None,
+    };
+
+    let amount = req.amount_usdc_micro;
+    if amount == 0 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "amount_usdc_micro must be > 0" })));
+    }
+    let notary_fee = req.notary_fee.unwrap_or(amount / 10);
+    let timeout_slots = req.timeout_slots.unwrap_or(1000);
+
+    let sk_bytes = state.0.node_signing_key.to_bytes();
+    let vk_bytes = state.0.node_signing_key.verifying_key().to_bytes();
+    let rpc_url = state.0.rpc_url.clone();
+    let kora = state.0.kora.clone();
+
+    use solana_rpc_client::nonblocking::rpc_client::RpcClient as SolanaRpc;
+    match crate::escrow::lock_payment_onchain(
+        &SolanaRpc::new(rpc_url),
+        sk_bytes,
+        vk_bytes,
+        provider_bytes,
+        conversation_id,
+        amount,
+        notary_fee,
+        notary_pubkey,
+        timeout_slots,
+        kora.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+    }
+}
+
+/// POST /escrow/approve
+///
+/// Approves and releases a locked escrow payment to the provider.
+/// Must be called by the notary or requester after the provider has delivered.
+async fn escrow_approve(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(req): Json<EscrowApproveRequest>,
+) -> impl IntoResponse {
+    if require_api_secret_or_unauthorized(&state, &headers).is_some() {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+    }
+
+    let requester_bytes: [u8; 32] = match hex::decode(&req.requester)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "requester: invalid hex or not 32 bytes" }))),
+    };
+
+    let provider_bytes: [u8; 32] = match hex::decode(&req.provider)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "provider: invalid hex or not 32 bytes" }))),
+    };
+
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+    };
+
+    let sk_bytes = state.0.node_signing_key.to_bytes();
+    let vk_bytes = state.0.node_signing_key.verifying_key().to_bytes();
+
+    // Notary defaults to self (this node is acting as approver/notary).
+    let notary_bytes: [u8; 32] = match req.notary {
+        Some(ref hex_str) => match hex::decode(hex_str).ok().and_then(|b| b.try_into().ok()) {
+            Some(a) => a,
+            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "notary: invalid hex or not 32 bytes" }))),
+        },
+        None => vk_bytes,
+    };
+
+    let rpc_url = state.0.rpc_url.clone();
+    let kora = state.0.kora.clone();
+
+    use solana_rpc_client::nonblocking::rpc_client::RpcClient as SolanaRpc;
+    match crate::escrow::approve_payment_onchain(
+        &SolanaRpc::new(rpc_url),
+        sk_bytes,
+        vk_bytes,
+        requester_bytes,
+        provider_bytes,
+        conversation_id,
+        notary_bytes,
+        kora.as_ref(),
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+    }
+}
+
 /// handler derives the destination ATA automatically).
+/// If `amount` is specified in the body, it sweeps that specific atomic amount.
+/// Otherwise, it sweeps the entire balance.
 ///
 /// Returns: `{ "signature": "...", "amount_usdc": 1.23, "destination": "..." }`
 pub async fn sweep_usdc(
@@ -1801,7 +2457,7 @@ pub async fn sweep_usdc(
         .send()
         .await;
 
-    let amount: u64 = match balance_resp {
+    let available_balance: u64 = match balance_resp {
         Err(e) => {
             return (
                 StatusCode::BAD_GATEWAY,
@@ -1843,13 +2499,27 @@ pub async fn sweep_usdc(
         }
     };
 
-    if amount < MIN_SWEEP_AMOUNT {
+    let amount_to_sweep = body.amount.unwrap_or(available_balance);
+
+    if amount_to_sweep < MIN_SWEEP_AMOUNT {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "balance too low to sweep",
-                "amount_atomic": amount,
+                "error": "requested amount too low to sweep",
+                "amount_atomic": amount_to_sweep,
                 "min_atomic": MIN_SWEEP_AMOUNT,
+            })),
+        )
+            .into_response();
+    }
+
+    if amount_to_sweep > available_balance {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "insufficient balance",
+                "requested_atomic": amount_to_sweep,
+                "available_atomic": available_balance,
             })),
         )
             .into_response();
@@ -1859,7 +2529,7 @@ pub async fn sweep_usdc(
     let spl_token_program: Pubkey =
         SPL_TOKEN_PROGRAM_ID.parse().expect("valid SPL_TOKEN_PROGRAM_ID");
     let mut ix_data = vec![3u8];
-    ix_data.extend_from_slice(&amount.to_le_bytes());
+    ix_data.extend_from_slice(&amount_to_sweep.to_le_bytes());
     let transfer_ix = solana_sdk::instruction::Instruction {
         program_id: spl_token_program,
         accounts: vec![
@@ -1922,11 +2592,12 @@ pub async fn sweep_usdc(
         };
         match kora.sign_and_send(&tx_b64).await {
             Ok(signer) => {
-                let amount_usdc = amount as f64 / 1_000_000.0;
+                let amount_usdc = amount_to_sweep as f64 / 1_000_000.0;
                 tracing::info!(
                     "Swept {amount_usdc:.6} USDC → {destination} via Kora (gasless, signer={signer})"
                 );
                 Json(serde_json::json!({
+                    "signature": signer,
                     "amount_usdc": amount_usdc,
                     "destination": destination.to_string(),
                     "via": "kora",
@@ -1963,7 +2634,7 @@ pub async fn sweep_usdc(
         let signed_b64 = B64.encode(&serialized);
         match broadcast_transaction(&state.0.rpc_url, &state.0.http_client, &signed_b64).await {
             Ok(signature) => {
-                let amount_usdc = amount as f64 / 1_000_000.0;
+                let amount_usdc = amount_to_sweep as f64 / 1_000_000.0;
                 tracing::info!("Swept {amount_usdc:.6} USDC → {destination}: tx={signature}");
                 Json(serde_json::json!({
                     "signature": signature,
@@ -2116,3 +2787,122 @@ async fn admin_exempt_remove(
     tracing::info!("Admin: removed exempt agent {agent_id}");
     Json(serde_json::json!({ "ok": true })).into_response()
 }
+
+pub async fn portfolio_history(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+) -> impl IntoResponse {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
+        return resp;
+    }
+    let history = state.0.portfolio_history.read().await;
+    Json(history.clone()).into_response()
+}
+
+#[derive(Serialize)]
+pub struct TokenBalance {
+    pub mint: String,
+    pub amount: f64,
+    pub decimals: u8,
+}
+
+#[derive(Serialize)]
+pub struct PortfolioBalances {
+    pub tokens: Vec<TokenBalance>,
+}
+
+pub async fn portfolio_balances(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+) -> Result<Json<PortfolioBalances>, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
+        return Err((
+            resp.status(),
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        ));
+    }
+
+    let pubkey = Pubkey::new_from_array(state.0.self_agent);
+    let mut tokens = Vec::new();
+
+    // Fetch SOL balance
+    match state
+        .0
+        .http_client
+        .post(&state.0.rpc_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [pubkey.to_string()]
+        }))
+        .send()
+        .await
+    {
+        Ok(res) => {
+            if let Ok(data) = res.json::<serde_json::Value>().await {
+                let lamports = data["result"]["value"].as_f64().unwrap_or(0.0);
+                if lamports > 0.0 {
+                    tokens.push(TokenBalance {
+                        mint: "So11111111111111111111111111111111111111112".to_string(), // SOL wrapped mint representation
+                        amount: lamports / 1_000_000_000.0,
+                        decimals: 9,
+                    });
+                }
+            }
+        }
+        Err(e) => tracing::error!("Failed to fetch SOL balance: {}", e),
+    }
+
+    // Fetch all SPL token balances
+    let spl_res = state
+        .0
+        .http_client
+        .post(&state.0.rpc_url)
+        .timeout(std::time::Duration::from_secs(15))
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                pubkey.to_string(),
+                { "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA" },
+                { "encoding": "jsonParsed" }
+            ]
+        }))
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Token accounts fetch failed: {e}")})),
+            )
+        })?;
+
+    let spl_data: serde_json::Value = spl_res.json().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Token accounts JSON parse failed: {e}")})),
+        )
+    })?;
+
+    if let Some(accounts) = spl_data["result"]["value"].as_array() {
+        for acc in accounts {
+            let parsed = &acc["account"]["data"]["parsed"]["info"];
+            let amount_f64 = parsed["tokenAmount"]["uiAmount"].as_f64().unwrap_or(0.0);
+            if amount_f64 > 0.0 {
+                let mint = parsed["mint"].as_str().unwrap_or("").to_string();
+                let decimals = parsed["tokenAmount"]["decimals"].as_u64().unwrap_or(0) as u8;
+                tokens.push(TokenBalance {
+                    mint,
+                    amount: amount_f64,
+                    decimals,
+                });
+            }
+        }
+    }
+
+    Ok(Json(PortfolioBalances { tokens }))
+}
+

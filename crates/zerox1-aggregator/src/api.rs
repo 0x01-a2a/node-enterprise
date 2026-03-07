@@ -1462,11 +1462,11 @@ pub async fn post_blob(
         .unwrap_or(false);
     let is_claimed = is_registered || state.store.is_agent_claimed(agent_id_hex);
 
-    let max_size = if is_claimed || score >= 100 {
+    let max_size = if is_claimed || score >= 100.0 {
         10 * 1024 * 1024 // 10 MB
-    } else if score >= 50 {
+    } else if score >= 50.0 {
         2 * 1024 * 1024 // 2 MB
-    } else if score >= 10 {
+    } else if score >= 10.0 {
         512 * 1024 // 512 KB
     } else {
         0 // Tier 0: Disabled

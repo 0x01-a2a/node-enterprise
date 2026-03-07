@@ -92,6 +92,304 @@ export interface SendFeedbackParams {
 }
 
 // ============================================================================
+// COUNTER negotiation types
+//
+// PROPOSE and COUNTER envelopes share a structured payload layout:
+//
+//   [bytes 0-15]  LE i128 — bid amount in USDC microunits (0 = unspecified)
+//   [bytes 16..]  JSON    — {"max_rounds": u8, "message": str}        (PROPOSE)
+//                           {"round": u8, "max_rounds": u8, "message": str} (COUNTER)
+//
+// Both sides can counter-propose up to maxRounds times (default: 2).
+// The proposer gets maxRounds = 3 if their average reputation score >= 70.
+// Round numbering is 1-indexed: first counter = round 1, second = round 2.
+// ============================================================================
+
+/** Decoded content of an incoming PROPOSE envelope payload. */
+export interface ProposePayload {
+  /** Amount in USDC microunits (e.g. 1_000_000n = 1 USDC). 0n = unspecified. */
+  amount: bigint
+  /** Maximum counter rounds the proposer allows. Default: 2. */
+  maxRounds: number
+  /** Human-readable proposal message. */
+  message: string
+}
+
+/** Decoded content of an incoming COUNTER envelope payload. */
+export interface CounterPayload {
+  /** Counter-offered amount in USDC microunits. */
+  amount: bigint
+  /** Which counter round this is (1-indexed). */
+  round: number
+  /** Maximum rounds as originally set in the PROPOSE. */
+  maxRounds: number
+  /** Human-readable counter message. */
+  message: string
+}
+
+export interface SendProposeParams {
+  /** Hex-encoded 32-byte agent ID of the target agent. */
+  recipient: string
+  /**
+   * 16-byte hex conversation ID. Auto-generated if omitted.
+   * The returned object includes the final conversation_id used.
+   */
+  conversationId?: string
+  /** Bid amount in USDC microunits. Default: 0n (unspecified). */
+  amount?: bigint
+  /**
+   * Max counter rounds allowed. Default: 2.
+   * Set to 3 if your average reputation score is >= 70.
+   */
+  maxRounds?: number
+  /** Proposal text (task description, terms, etc.). */
+  message: string
+}
+
+export interface SendCounterParams {
+  /** Hex-encoded 32-byte agent ID of the counterparty. */
+  recipient: string
+  /** Conversation ID from the original PROPOSE. */
+  conversationId: string
+  /** Counter-offered amount in USDC microunits. */
+  amount: bigint
+  /** Counter round number (1-indexed). Must be <= maxRounds. */
+  round: number
+  /** maxRounds from the original PROPOSE. */
+  maxRounds: number
+  /** Explanation of your counter-offer. */
+  message?: string
+}
+
+/** Decoded content of an incoming ACCEPT envelope payload. */
+export interface AcceptPayload {
+  /**
+   * The amount being accepted in USDC microunits.
+   * Matches the most-recent COUNTER amount, or the original PROPOSE amount
+   * if no COUNTER was issued. Use this value for `lockPayment`.
+   */
+  amount: bigint
+  /** Optional acceptance message. */
+  message: string
+}
+
+export interface SendAcceptParams {
+  /** Hex-encoded 32-byte agent ID of the agent whose offer you are accepting. */
+  recipient: string
+  /** Conversation ID from the original PROPOSE. */
+  conversationId: string
+  /**
+   * The agreed amount in USDC microunits — must match the most-recent COUNTER
+   * (or original PROPOSE if no COUNTER was sent). Both parties use this
+   * to call `lockPayment` with the correct amount.
+   */
+  amount: bigint
+  /** Optional acceptance message. */
+  message?: string
+}
+
+export interface LockPaymentParams {
+  /** Hex-encoded 32-byte agent_id of the provider who will receive payment. */
+  provider: string
+  /** Hex-encoded 16-byte conversation ID from the negotiation. */
+  conversationId: string
+  /** Amount to lock in USDC microunits (must match the ACCEPT amount). */
+  amount: bigint
+  /** Notary fee in USDC microunits. Default: amount / 10n. */
+  notaryFee?: bigint
+  /** Solana slot timeout before provider can claim without approval. Default: 1000. */
+  timeoutSlots?: number
+  /** Hex-encoded 32-byte agent_id of a designated notary (optional). */
+  notary?: string
+}
+
+export interface ApprovePaymentParams {
+  /** Hex-encoded 32-byte agent_id of the requester (payer). */
+  requester: string
+  /** Hex-encoded 32-byte agent_id of the provider (payee). */
+  provider: string
+  /** Hex-encoded 16-byte conversation ID from the negotiation. */
+  conversationId: string
+  /** Hex-encoded 32-byte agent_id of the notary. Defaults to this agent (self-approval). */
+  notary?: string
+}
+
+// ============================================================================
+// Token swap whitelist
+// ============================================================================
+
+/**
+ * Default token mint addresses allowed in agent-to-agent swaps.
+ * Prevents agents from being tricked into swapping into fraudulent tokens.
+ *
+ * Both devnet and mainnet mints are included; the node validates against
+ * whichever network it is connected to.
+ *
+ * Override per-agent with `Zerox1Agent.setSwapWhitelist()`.
+ */
+export const DEFAULT_SWAP_WHITELIST: ReadonlySet<string> = new Set([
+  // SOL (wrapped)
+  'So11111111111111111111111111111111111111112',
+  // USDC — mainnet
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  // USDC — devnet
+  '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
+  // USDT — mainnet
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  // JUP
+  'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
+  // BONK
+  'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+  // RAY
+  '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',
+  // WIF
+  'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm',
+])
+
+export interface SwapParams {
+  /** Solana base58 mint address of the token to sell. */
+  inputMint: string
+  /** Solana base58 mint address of the token to buy. */
+  outputMint: string
+  /** Amount in input-token native units (e.g. lamports for SOL). */
+  amount: bigint
+  /** Max slippage in basis points. Default: 50 (0.5%). */
+  slippageBps?: number
+  /** Custom whitelist to use instead of DEFAULT_SWAP_WHITELIST. Pass an empty set to disable. */
+  whitelist?: ReadonlySet<string>
+}
+
+export interface SwapResult {
+  /** Input amount actually consumed (native units). */
+  inAmount: bigint
+  /** Output amount received (native units). */
+  outAmount: bigint
+  /** Transaction signature. */
+  signature: string
+}
+
+// ============================================================================
+// PROPOSE / COUNTER payload encode + decode helpers
+// ============================================================================
+
+function writeBidPrefix(amount: bigint): Buffer {
+  const buf = Buffer.alloc(16)
+  buf.writeBigUInt64LE(amount & 0xFFFFFFFFFFFFFFFFn, 0)
+  buf.writeBigUInt64LE(amount >> 64n, 8)
+  return buf
+}
+
+function readBidPrefix(raw: Buffer): bigint {
+  const lo = raw.readBigUInt64LE(0)
+  const hi = raw.readBigUInt64LE(8)
+  return (hi << 64n) | lo
+}
+
+/**
+ * Encode a PROPOSE payload into the structured wire format:
+ * `[16-byte LE i128 amount][JSON {"max_rounds": N, "message": "..."}]`
+ */
+export function encodeProposePayload(
+  message: string,
+  amount: bigint = 0n,
+  maxRounds: number = 2,
+): Buffer {
+  const prefix = writeBidPrefix(amount)
+  const json = Buffer.from(JSON.stringify({ max_rounds: maxRounds, message }))
+  return Buffer.concat([prefix, json])
+}
+
+/**
+ * Encode a COUNTER payload into the structured wire format:
+ * `[16-byte LE i128 amount][JSON {"round": N, "max_rounds": M, "message": "..."}]`
+ */
+export function encodeCounterPayload(
+  amount: bigint,
+  round: number,
+  maxRounds: number,
+  message: string = '',
+): Buffer {
+  const prefix = writeBidPrefix(amount)
+  const json = Buffer.from(JSON.stringify({ round, max_rounds: maxRounds, message }))
+  return Buffer.concat([prefix, json])
+}
+
+/**
+ * Decode a PROPOSE envelope payload.
+ * Returns `null` if the payload is not in the structured format
+ * (e.g. a raw-string PROPOSE from an older agent).
+ */
+export function decodeProposePayload(payloadB64: string): ProposePayload | null {
+  const raw = Buffer.from(payloadB64, 'base64')
+  if (raw.length < 17 || raw[16] !== 0x7b /* '{' */) return null
+  try {
+    const body = JSON.parse(raw.slice(16).toString('utf8')) as Record<string, unknown>
+    return {
+      amount: readBidPrefix(raw),
+      maxRounds: Number(body['max_rounds'] ?? 2),
+      message: String(body['message'] ?? ''),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Encode an ACCEPT payload.
+ * `[16-byte LE i128 amount][JSON {"message": "..."}]`
+ *
+ * Both parties must use the same `amount` — it is the agreed price that
+ * will be passed to `lockPayment` on-chain.
+ */
+export function encodeAcceptPayload(
+  amount: bigint,
+  message: string = '',
+): Buffer {
+  const prefix = writeBidPrefix(amount)
+  const json = Buffer.from(JSON.stringify({ message }))
+  return Buffer.concat([prefix, json])
+}
+
+/**
+ * Decode an ACCEPT envelope payload.
+ * Returns `null` if the payload is not in the structured format
+ * (older agents may send a plain-text ACCEPT).
+ */
+export function decodeAcceptPayload(payloadB64: string): AcceptPayload | null {
+  const raw = Buffer.from(payloadB64, 'base64')
+  if (raw.length < 17 || raw[16] !== 0x7b /* '{' */) return null
+  try {
+    const body = JSON.parse(raw.slice(16).toString('utf8')) as Record<string, unknown>
+    return {
+      amount: readBidPrefix(raw),
+      message: String(body['message'] ?? ''),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Decode a COUNTER envelope payload.
+ * Returns `null` if the payload is not in the structured format.
+ */
+export function decodeCounterPayload(payloadB64: string): CounterPayload | null {
+  const raw = Buffer.from(payloadB64, 'base64')
+  if (raw.length < 17 || raw[16] !== 0x7b /* '{' */) return null
+  try {
+    const body = JSON.parse(raw.slice(16).toString('utf8')) as Record<string, unknown>
+    return {
+      amount: readBidPrefix(raw),
+      round: Number(body['round'] ?? 1),
+      maxRounds: Number(body['max_rounds'] ?? 2),
+      message: String(body['message'] ?? ''),
+    }
+  } catch {
+    return null
+  }
+}
+
+// ============================================================================
 // Hosting types
 // ============================================================================
 
@@ -265,6 +563,7 @@ export class Zerox1Agent {
   private port: number = 0
   private nodeUrl: string = ''
   private _reconnectDelay: number = 1000
+  private _swapWhitelist: ReadonlySet<string> = DEFAULT_SWAP_WHITELIST
 
   private constructor() { }
 
@@ -561,6 +860,203 @@ export class Zerox1Agent {
     })
   }
 
+  /**
+   * Send a PROPOSE envelope.
+   *
+   * Calls POST /negotiate/propose — the node handles binary payload encoding.
+   * Returns the conversation ID used (auto-generated if not supplied)
+   * along with the send confirmation.
+   */
+  async sendPropose(
+    params: SendProposeParams
+  ): Promise<{ conversationId: string; confirmation: SentConfirmation }> {
+    const res = await fetch(`${this.nodeUrl}/negotiate/propose`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recipient: params.recipient,
+        conversation_id: params.conversationId,
+        amount_usdc_micro: params.amount !== undefined ? Number(params.amount) : undefined,
+        max_rounds: params.maxRounds,
+        message: params.message,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as Record<string, unknown>
+      throw new Error((err['error'] as string) ?? `HTTP ${res.status}`)
+    }
+    const json = await res.json() as Record<string, unknown>
+    return {
+      conversationId: json['conversation_id'] as string,
+      confirmation: { nonce: json['nonce'] as number, payloadHash: json['payload_hash'] as string },
+    }
+  }
+
+  /**
+   * Send a COUNTER envelope.
+   *
+   * Calls POST /negotiate/counter — the node handles binary payload encoding.
+   * Protocol rules: `round` must be 1-indexed and <= `maxRounds`.
+   */
+  async sendCounter(params: SendCounterParams): Promise<SentConfirmation> {
+    if (params.round < 1 || params.round > params.maxRounds) {
+      throw new RangeError(`round ${params.round} is out of range [1, ${params.maxRounds}]`)
+    }
+    const res = await fetch(`${this.nodeUrl}/negotiate/counter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recipient: params.recipient,
+        conversation_id: params.conversationId,
+        amount_usdc_micro: Number(params.amount),
+        round: params.round,
+        max_rounds: params.maxRounds,
+        message: params.message,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as Record<string, unknown>
+      throw new Error((err['error'] as string) ?? `HTTP ${res.status}`)
+    }
+    const json = await res.json() as Record<string, unknown>
+    return { nonce: json['nonce'] as number, payloadHash: json['payload_hash'] as string }
+  }
+
+  /**
+   * Send an ACCEPT envelope with the agreed amount.
+   *
+   * Calls POST /negotiate/accept — the node handles binary payload encoding.
+   * The `amount` must match the most-recent COUNTER (or original PROPOSE if
+   * there was no counter). Both parties use this value to call `lockPayment`.
+   */
+  async sendAccept(params: SendAcceptParams): Promise<SentConfirmation> {
+    const res = await fetch(`${this.nodeUrl}/negotiate/accept`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        recipient: params.recipient,
+        conversation_id: params.conversationId,
+        amount_usdc_micro: Number(params.amount),
+        message: params.message,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as Record<string, unknown>
+      throw new Error((err['error'] as string) ?? `HTTP ${res.status}`)
+    }
+    const json = await res.json() as Record<string, unknown>
+    return { nonce: json['nonce'] as number, payloadHash: json['payload_hash'] as string }
+  }
+
+  /**
+   * Lock USDC in the escrow program on-chain.
+   *
+   * Call this after `sendAccept()` to fund the escrow account before the
+   * provider begins work. The node signs the Solana transaction using its
+   * own keypair (this agent is the requester / payer).
+   *
+   * The automatic lock triggered by `sendAccept()` (via the node loop) uses
+   * default parameters. Use this method for explicit control — e.g. a custom
+   * notary or timeout.
+   *
+   * @param params.amount — must match the amount in the ACCEPT payload exactly.
+   */
+  async lockPayment(params: LockPaymentParams): Promise<void> {
+    const res = await fetch(`${this.nodeUrl}/escrow/lock`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: params.provider,
+        conversation_id: params.conversationId,
+        amount_usdc_micro: Number(params.amount),
+        notary_fee: params.notaryFee !== undefined ? Number(params.notaryFee) : undefined,
+        timeout_slots: params.timeoutSlots,
+        notary: params.notary,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as Record<string, unknown>
+      throw new Error(`lockPayment failed: ${(err['error'] as string) ?? res.status}`)
+    }
+  }
+
+  /**
+   * Approve and release a locked escrow payment to the provider.
+   *
+   * Call this after verifying the provider's DELIVER output is satisfactory.
+   * The node signs as the approver (notary or requester).
+   *
+   * @param params.notary — defaults to this agent (self-approval when no separate notary).
+   */
+  async approvePayment(params: ApprovePaymentParams): Promise<void> {
+    const res = await fetch(`${this.nodeUrl}/escrow/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requester: params.requester,
+        provider: params.provider,
+        conversation_id: params.conversationId,
+        notary: params.notary,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as Record<string, unknown>
+      throw new Error(`approvePayment failed: ${(err['error'] as string) ?? res.status}`)
+    }
+  }
+
+  // ── Token swap ────────────────────────────────────────────────────────────
+
+  /**
+   * Override the token whitelist for this agent instance.
+   * Pass an empty Set to disable whitelist enforcement (not recommended).
+   */
+  setSwapWhitelist(whitelist: ReadonlySet<string>): void {
+    this._swapWhitelist = whitelist
+  }
+
+  /**
+   * Execute a Jupiter token swap via the node's `/trade/swap` endpoint.
+   *
+   * Both `inputMint` and `outputMint` must be in the active whitelist
+   * (DEFAULT_SWAP_WHITELIST unless overridden via `setSwapWhitelist()`).
+   * This prevents agents from being deceived into swapping fraudulent tokens.
+   *
+   * @throws If either mint is not whitelisted, or the node rejects the swap.
+   */
+  async swap(params: SwapParams): Promise<SwapResult> {
+    const whitelist = params.whitelist ?? this._swapWhitelist
+    if (whitelist.size > 0) {
+      if (!whitelist.has(params.inputMint)) {
+        throw new Error(`swap: inputMint ${params.inputMint} is not in the token whitelist`)
+      }
+      if (!whitelist.has(params.outputMint)) {
+        throw new Error(`swap: outputMint ${params.outputMint} is not in the token whitelist`)
+      }
+    }
+
+    const res = await fetch(`${this.nodeUrl}/trade/swap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input_mint: params.inputMint,
+        output_mint: params.outputMint,
+        amount: params.amount.toString(),
+        slippage_bps: params.slippageBps ?? 50,
+      }),
+    })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as Record<string, unknown>
+      throw new Error(`swap failed: ${(err['error'] as string) ?? res.status}`)
+    }
+    const data = await res.json() as { in_amount: string; out_amount: string; signature: string }
+    return {
+      inAmount: BigInt(data.in_amount),
+      outAmount: BigInt(data.out_amount),
+      signature: data.signature,
+    }
+  }
+
   // ── Utilities ─────────────────────────────────────────────────────────────
 
   /** Generate a random 16-byte conversation ID as hex. */
@@ -573,6 +1069,7 @@ export class Zerox1Agent {
   /**
    * Encode a bid value (i128 LE) into the first 16 bytes of a payload,
    * followed by optional extra bytes (your terms).
+   * @deprecated Use `encodeProposePayload()` or `encodeCounterPayload()` instead.
    */
   encodeBidValue(value: bigint, rest: Buffer = Buffer.alloc(0)): Buffer {
     const buf = Buffer.alloc(16)
@@ -806,6 +1303,79 @@ export class HostedAgent {
     )
 
     return this.send({ msgType: 'FEEDBACK', conversationId: params.conversationId, payload })
+  }
+
+  /** Send a PROPOSE envelope via POST /hosted/negotiate/propose. */
+  async sendPropose(
+    params: SendProposeParams
+  ): Promise<{ conversationId: string }> {
+    const res = await fetch(`${this.baseUrl}/hosted/negotiate/propose`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        recipient: params.recipient,
+        conversation_id: params.conversationId,
+        amount_usdc_micro: params.amount !== undefined ? Number(params.amount) : undefined,
+        max_rounds: params.maxRounds,
+        message: params.message,
+      }),
+    })
+    if (!res.ok) {
+      const body = await res.text()
+      throw new Error(`hosted propose failed (${res.status}): ${body}`)
+    }
+    const json = await res.json() as Record<string, unknown>
+    return { conversationId: json['conversation_id'] as string }
+  }
+
+  /** Send a COUNTER envelope via POST /hosted/negotiate/counter. */
+  async sendCounter(params: SendCounterParams): Promise<void> {
+    if (params.round < 1 || params.round > params.maxRounds) {
+      throw new RangeError(`round ${params.round} is out of range [1, ${params.maxRounds}]`)
+    }
+    const res = await fetch(`${this.baseUrl}/hosted/negotiate/counter`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        recipient: params.recipient,
+        conversation_id: params.conversationId,
+        amount_usdc_micro: Number(params.amount),
+        round: params.round,
+        max_rounds: params.maxRounds,
+        message: params.message,
+      }),
+    })
+    if (!res.ok && res.status !== 204) {
+      const body = await res.text()
+      throw new Error(`hosted counter failed (${res.status}): ${body}`)
+    }
+  }
+
+  /** Send an ACCEPT envelope via POST /hosted/negotiate/accept. */
+  async sendAccept(params: SendAcceptParams): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/hosted/negotiate/accept`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.token}`,
+      },
+      body: JSON.stringify({
+        recipient: params.recipient,
+        conversation_id: params.conversationId,
+        amount_usdc_micro: Number(params.amount),
+        message: params.message,
+      }),
+    })
+    if (!res.ok && res.status !== 204) {
+      const body = await res.text()
+      throw new Error(`hosted accept failed (${res.status}): ${body}`)
+    }
   }
 
   /** Generate a random 16-byte conversation ID as hex. */

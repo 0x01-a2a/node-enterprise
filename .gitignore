@@ -11,7 +11,7 @@ programs/workspace/target/
 sdk/packages/*/bin/
 
 # TypeScript / Node
-sdk/node_modules/
+node_modules/
 sdk/dist/
 sdk/*.tsbuildinfo
 

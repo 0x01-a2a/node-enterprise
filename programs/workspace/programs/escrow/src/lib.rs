@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program_pack::Pack;
 use anchor_spl::{
     associated_token::AssociatedToken,
-    token::{self, Mint, Token, TokenAccount, Transfer},
+    token::{self, CloseAccount, Mint, Token, TokenAccount, Transfer},
 };
 
 declare_id!("Es69yGQ7XnwhHjoj3TRv5oigUsQzCvbRYGXJTFcJrT9F");
@@ -82,6 +82,9 @@ pub mod escrow {
         notary: Option<Pubkey>,
         timeout_slots: u64,
     ) -> Result<()> {
+        #[cfg(not(feature = "localtest"))]
+        require!(ctx.accounts.usdc_mint.key() == USDC_MINT, EscrowError::InvalidMint);
+
         require!(amount > 0, EscrowError::ZeroAmount);
         require!(
             notary.is_some() || notary_fee == 0,
@@ -212,17 +215,19 @@ pub mod escrow {
         if has_notary_payout {
             // Validate that notary_usdc is the designated notary's USDC token account.
             let expected_notary = designated_notary.ok_or(EscrowError::Unauthorized)?;
-            let notary_data = ctx.accounts.notary_usdc.try_borrow_data()?;
-            let parsed = anchor_spl::token::spl_token::state::Account::unpack(&notary_data)
-                .map_err(|_| EscrowError::InvalidNotaryUsdc)?;
-            require!(
-                parsed.owner == expected_notary,
-                EscrowError::InvalidNotaryUsdc
-            );
-            require!(
-                parsed.mint == ctx.accounts.usdc_mint.key(),
-                EscrowError::InvalidNotaryUsdc
-            );
+            {
+                let notary_data = ctx.accounts.notary_usdc.try_borrow_data()?;
+                let parsed = anchor_spl::token::spl_token::state::Account::unpack(&notary_data)
+                    .map_err(|_| EscrowError::InvalidNotaryUsdc)?;
+                require!(
+                    parsed.owner == expected_notary,
+                    EscrowError::InvalidNotaryUsdc
+                );
+                require!(
+                    parsed.mint == ctx.accounts.usdc_mint.key(),
+                    EscrowError::InvalidNotaryUsdc
+                );
+            } // borrow dropped here before the CPI
 
             token::transfer(
                 CpiContext::new_with_signer(
@@ -237,6 +242,19 @@ pub mod escrow {
                 notary_fee,
             )?;
         }
+
+        // Close vault ATA — return rent (~0.002 SOL) to requester.
+        token::close_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                CloseAccount {
+                    account: ctx.accounts.escrow_vault.to_account_info(),
+                    destination: ctx.accounts.requester.to_account_info(),
+                    authority: ctx.accounts.escrow_vault_authority.to_account_info(),
+                },
+                vault_auth_seeds,
+            ),
+        )?;
 
         let _ = seeds; // suppress unused warning
         msg!(
@@ -314,6 +332,19 @@ pub mod escrow {
             )?;
         }
 
+        // Close vault ATA — return rent (~0.002 SOL) to requester.
+        token::close_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                CloseAccount {
+                    account: ctx.accounts.escrow_vault.to_account_info(),
+                    destination: ctx.accounts.requester.to_account_info(),
+                    authority: ctx.accounts.escrow_vault_authority.to_account_info(),
+                },
+                vault_auth_seeds,
+            ),
+        )?;
+
         let _ = (requester, provider, conv_id, bump);
         msg!(
             "Timeout claimed: {} USDC to provider (incl. {} notary_fee), {} fee",
@@ -370,6 +401,19 @@ pub mod escrow {
             total,
         )?;
 
+        // Close vault ATA — return rent (~0.002 SOL) to requester.
+        token::close_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                CloseAccount {
+                    account: ctx.accounts.escrow_vault.to_account_info(),
+                    destination: ctx.accounts.requester.to_account_info(),
+                    authority: ctx.accounts.escrow_vault_authority.to_account_info(),
+                },
+                vault_auth_seeds,
+            ),
+        )?;
+
         let _ = (requester, provider, conv_id, bump);
         msg!("Escrow cancelled: {} USDC returned to requester", total);
         Ok(())
@@ -420,7 +464,6 @@ pub struct LockPayment<'info> {
     )]
     pub requester_usdc: Account<'info, TokenAccount>,
 
-    #[account(address = USDC_MINT)]
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -487,7 +530,6 @@ pub struct ApprovePayment<'info> {
     #[account(mut)]
     pub notary_usdc: UncheckedAccount<'info>,
 
-    #[account(address = USDC_MINT)]
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
 }
@@ -545,13 +587,13 @@ pub struct ClaimTimeout<'info> {
     #[account(address = TREASURY_PUBKEY)]
     pub treasury: UncheckedAccount<'info>,
 
-    #[account(address = USDC_MINT)]
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
 pub struct CancelEscrow<'info> {
+    #[account(mut)]
     pub requester: Signer<'info>,
 
     #[account(
@@ -589,7 +631,6 @@ pub struct CancelEscrow<'info> {
     )]
     pub requester_usdc: Account<'info, TokenAccount>,
 
-    #[account(address = USDC_MINT)]
     pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
 }
@@ -651,4 +692,6 @@ pub enum EscrowError {
     TimeoutAlreadyReached,
     #[msg("notary_usdc must be the designated notary's USDC token account")]
     InvalidNotaryUsdc,
+    #[msg("usdc_mint must be the canonical USDC mint")]
+    InvalidMint,
 }

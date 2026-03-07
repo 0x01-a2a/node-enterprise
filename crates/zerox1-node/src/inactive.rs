@@ -19,7 +19,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-use crate::{identity::AgentIdentity, kora::KoraClient, lease::get_ata};
+use crate::{api::{ApiState, PortfolioEvent}, identity::AgentIdentity, kora::KoraClient, lease::get_ata};
 
 // ============================================================================
 // Constants — must match stake-lock program
@@ -62,6 +62,7 @@ pub async fn check_and_slash_inactive(
     kora: Option<&KoraClient>,
     usdc_mint: &Pubkey,
     agents: &[[u8; 32]],
+    api: &ApiState,
 ) {
     let unix_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -140,6 +141,8 @@ pub async fn check_and_slash_inactive(
             &vault_ata,
             &registry_pda,
             &stake_lock_program,
+            api,
+            agent_id,
         )
         .await
         {
@@ -174,6 +177,8 @@ async fn submit_slash_inactive(
     vault_ata: &Pubkey,
     agent_registry: &Pubkey,
     stake_lock_program: &Pubkey,
+    api: &ApiState,
+    slashed_agent: &[u8; 32],
 ) -> anyhow::Result<()> {
     let ix = build_slash_inactive_ix(
         caller_pubkey,
@@ -220,10 +225,21 @@ async fn submit_slash_inactive(
             &[&solana_kp],
             recent_blockhash,
         );
-        rpc.send_and_confirm_transaction(&tx)
-            .await
+        rpc.send_and_confirm_transaction(&tx).await
             .map_err(|e| anyhow::anyhow!("send_and_confirm: {e}"))?;
     }
+
+    // Record bounty in portfolio history
+    // For StakeLock v1, slash bounty is exactly 50% of MIN_STAKE_USDC = 50 USDC.
+    api.record_portfolio_event(PortfolioEvent::Bounty {
+        amount_usdc: (crate::stake_lock::MIN_STAKE_USDC as f64 / 2.0) / 1_000_000.0,
+        from_agent: hex::encode(slashed_agent),
+        conversation_id: "slash_bounty".to_string(),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    }).await;
 
     Ok(())
 }

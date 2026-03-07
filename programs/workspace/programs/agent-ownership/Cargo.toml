@@ -11,6 +11,7 @@ name = "agent_ownership"
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
+localtest = []
 cpi = ["no-entrypoint"]
 default = []
 
