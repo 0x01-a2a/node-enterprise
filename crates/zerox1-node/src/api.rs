@@ -598,13 +598,15 @@ impl ApiState {
     }
 
     pub async fn load_portfolio_history(&self, path: PathBuf) -> anyhow::Result<()> {
-        let mut arc = Arc::clone(&self.0);
-        let inner = Arc::get_mut(&mut arc).expect("ApiInner unique ref for init");
-        inner.portfolio_persist_path = path.clone();
+        {
+            let mut inner = self.0.write().await;
+            inner.portfolio_persist_path = path.clone();
+        }
 
         if path.exists() {
             let data = std::fs::read_to_string(&path)?;
             let history: PortfolioHistory = serde_json::from_str(&data)?;
+            let mut inner = self.0.write().await;
             *inner.portfolio_history.get_mut() = history;
         }
         Ok(())
