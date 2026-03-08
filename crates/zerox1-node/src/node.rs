@@ -189,7 +189,7 @@ impl Zx01Node {
         let exempt_persist_path = config.log_dir.join("exempt_agents.json");
         let mut exempt_set = std::collections::HashSet::<[u8; 32]>::new();
 
-        if let Ok(data) = std::fs::read_to_string(&exempt_persist_path) {
+        if let Ok(data) = tokio::fs::read_to_string(&exempt_persist_path).await {
             if let Ok(ids) = serde_json::from_str::<Vec<String>>(&data) {
                 for hex_str in ids {
                     if let Ok(bytes) = hex::decode(&hex_str) {
@@ -223,7 +223,7 @@ impl Zx01Node {
 
         // ── Bags fee-sharing: resolve distribution address at startup ─────────
         #[cfg(feature = "bags")]
-        let bags_config: Option<std::sync::Arc<crate::bags::BagsConfig>> = {
+        let bags_config: Option<std::sync::Arc<crate::bags::BagsConfig>> = 'bags: {
             use std::str::FromStr as _;
             if config.bags_fee_bps == 0 {
                 None
@@ -242,10 +242,16 @@ impl Zx01Node {
                         config.bags_api_url.clone(),
                         http_client.clone(),
                     )?;
-                    api_client.resolve_distribution_address().await
-                    .map_err(|e| {
-                        anyhow::anyhow!("Bags API unavailable and --bags-wallet not set: {e}")
-                    })?
+                    match api_client.resolve_distribution_address().await {
+                        Ok(wallet) => wallet,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Bags fee-sharing disabled for this run: Bags API unavailable and \
+                                 --bags-wallet not set: {e}"
+                            );
+                            break 'bags None;
+                        }
+                    }
                 };
                 tracing::info!(
                     "Bags fee-sharing enabled: {} bps → {}",
@@ -262,10 +268,19 @@ impl Zx01Node {
 
         #[cfg(feature = "bags")]
         let bags_launch: Option<std::sync::Arc<crate::bags::BagsLaunchClient>> =
-            config.bags_api_key.as_ref().map(|key| {
-                tracing::info!("Bags launch API enabled (key configured)");
+            config
+                .bags_api_key
+                .as_ref()
+                .or(config.bags_partner_key.as_ref())
+                .map(|key| {
+                if config.bags_partner_key.is_some() {
+                    tracing::info!("Bags launch API enabled in partner-first mode");
+                } else {
+                    tracing::info!("Bags launch API enabled (API key configured)");
+                }
                 std::sync::Arc::new(crate::bags::BagsLaunchClient::new(
                     key.clone(),
+                    config.bags_partner_key.clone(),
                     http_client.clone(),
                 ))
             });

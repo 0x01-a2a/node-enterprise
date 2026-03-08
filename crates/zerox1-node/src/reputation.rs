@@ -127,3 +127,136 @@ impl ReputationTracker {
         self.current_epoch
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    // --- apply_feedback (role 0 = participant) ---
+
+    #[test]
+    fn first_feedback_sets_score_to_delta() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(1), 100, 0, 1);
+        let v = tracker.get(&agent(1)).unwrap();
+        // delta = 100 * 1_000 = 100_000; n=1 → score = (0*0 + 100_000)/1 = 100_000
+        assert_eq!(v.reliability_score, 100_000);
+        assert_eq!(v.cooperation_index, 100_000);
+        assert_eq!(v.total_tasks, 1);
+    }
+
+    #[test]
+    fn second_feedback_averages_scores() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(1), 100, 0, 1);
+        tracker.apply_feedback(agent(1), 0, 0, 2);
+        let v = tracker.get(&agent(1)).unwrap();
+        // After 2 tasks: avg of 100_000 and 0 = 50_000
+        assert_eq!(v.reliability_score, 50_000);
+        assert_eq!(v.total_tasks, 2);
+    }
+
+    #[test]
+    fn negative_feedback_reduces_score() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(2), -100, 0, 1);
+        let v = tracker.get(&agent(2)).unwrap();
+        assert_eq!(v.reliability_score, -100_000);
+    }
+
+    #[test]
+    fn mixed_feedback_converges_toward_zero() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(3), 100, 0, 1);
+        tracker.apply_feedback(agent(3), -100, 0, 2);
+        let v = tracker.get(&agent(3)).unwrap();
+        assert_eq!(v.reliability_score, 0);
+    }
+
+    // --- apply_feedback (role 1 = notary) ---
+
+    #[test]
+    fn notary_feedback_updates_notary_accuracy_not_tasks() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(4), 80, 1, 1);
+        let v = tracker.get(&agent(4)).unwrap();
+        assert_eq!(v.notary_accuracy, 80_000);
+        assert_eq!(v.total_notarized, 1);
+        assert_eq!(v.total_tasks, 0);
+        // reliability and cooperation unchanged
+        assert_eq!(v.reliability_score, 0);
+    }
+
+    // --- record_dispute ---
+
+    #[test]
+    fn record_dispute_increments_counter() {
+        let mut tracker = ReputationTracker::new();
+        tracker.record_dispute(agent(5));
+        tracker.record_dispute(agent(5));
+        let v = tracker.get(&agent(5)).unwrap();
+        assert_eq!(v.total_disputes, 2);
+    }
+
+    #[test]
+    fn record_dispute_creates_entry_if_absent() {
+        let mut tracker = ReputationTracker::new();
+        assert!(tracker.get(&agent(6)).is_none());
+        tracker.record_dispute(agent(6));
+        assert!(tracker.get(&agent(6)).is_some());
+    }
+
+    // --- record_activity ---
+
+    #[test]
+    fn record_activity_advances_last_active_epoch() {
+        let mut tracker = ReputationTracker::new();
+        tracker.record_activity(agent(7), 10);
+        assert_eq!(tracker.get(&agent(7)).unwrap().last_active_epoch, 10);
+        // smaller epoch does not regress
+        tracker.record_activity(agent(7), 5);
+        assert_eq!(tracker.get(&agent(7)).unwrap().last_active_epoch, 10);
+        // larger epoch advances
+        tracker.record_activity(agent(7), 20);
+        assert_eq!(tracker.get(&agent(7)).unwrap().last_active_epoch, 20);
+    }
+
+    // --- advance_epoch (decay) ---
+
+    #[test]
+    fn advance_epoch_does_not_decay_active_agents() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(8), 100, 0, 10);
+        // current_epoch=0 after first feedback; advance to 10 (same as last_active)
+        tracker.advance_epoch(10);
+        let v = tracker.get(&agent(8)).unwrap();
+        // idle = 10 - 10 = 0 ≤ DECAY_WINDOW_EPOCHS(6) → no decay
+        assert_eq!(v.reliability_score, 100_000);
+    }
+
+    #[test]
+    fn advance_epoch_decays_idle_agents() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(9), 100, 0, 0);
+        // DECAY_WINDOW_EPOCHS = 6; advance 8 epochs so idle = 8 > 6 → 2 decay steps
+        tracker.advance_epoch(8);
+        let v = tracker.get(&agent(9)).unwrap();
+        // expected: 100_000 * (95/100)^2 = 100_000 * 0.9025 = 90_250
+        let expected = 100_000i64 * 95 / 100 * 95 / 100;
+        assert_eq!(v.reliability_score, expected);
+    }
+
+    #[test]
+    fn advance_epoch_decay_reaches_near_zero_after_many_epochs() {
+        let mut tracker = ReputationTracker::new();
+        tracker.apply_feedback(agent(10), 100, 0, 0);
+        // Advance 200 epochs — score should be very small (but may not be exactly 0 due to int division)
+        tracker.advance_epoch(200);
+        let v = tracker.get(&agent(10)).unwrap();
+        assert!(v.reliability_score.abs() < 10, "score should decay near zero");
+    }
+}

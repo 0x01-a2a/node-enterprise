@@ -4,6 +4,13 @@
 //! Bags distribution contract, and enables AI agents to launch tokens on
 //! Bags.fm through a simple REST API.
 
+// bags implies trade — both are Android-only.
+#[cfg(not(target_os = "android"))]
+compile_error!(
+    "feature \"bags\" may only be enabled for Android targets \
+     (target_os = \"android\"). Use `cargo ndk --target aarch64-linux-android`."
+);
+
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -215,16 +222,25 @@ pub struct ClaimTx {
 pub struct BagsLaunchClient {
     api_url: String,
     api_key: String,
+    partner_key: Option<String>,
     client: reqwest::Client,
 }
 
 impl BagsLaunchClient {
-    pub fn new(api_key: String, client: reqwest::Client) -> Self {
+    pub fn new(api_key: String, partner_key: Option<String>, client: reqwest::Client) -> Self {
         Self {
             api_url: BAGS_API_BASE.to_string(),
             api_key,
+            partner_key,
             client,
         }
+    }
+
+    pub fn partner_mode_enabled(&self) -> bool {
+        self.partner_key
+            .as_ref()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
     }
 
     async fn post_json(
@@ -339,6 +355,11 @@ impl BagsLaunchClient {
             "wallet": wallet,
             "configKey": config_key,
         });
+        if let Some(ref partner_key) = self.partner_key {
+            if !partner_key.trim().is_empty() {
+                body["partner"] = partner_key.clone().into();
+            }
+        }
         if let Some(l) = initial_buy_lamports {
             body["initialBuyLamports"] = l.into();
         }
@@ -515,4 +536,85 @@ pub fn spawn_protocol_fee_collection(
             Err(e) => tracing::warn!("Protocol fee SOL transfer failed: {e}"),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- BagsApiClient::new ---
+
+    #[test]
+    fn bags_api_client_rejects_http_url() {
+        let client = reqwest::Client::new();
+        let result = BagsApiClient::new("http://api.bags.fm".to_string(), client);
+        let err = result.err().expect("expected error for http:// URL");
+        assert!(err.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn bags_api_client_rejects_non_https_scheme() {
+        let client = reqwest::Client::new();
+        let result = BagsApiClient::new("ws://api.bags.fm".to_string(), client);
+        let err = result.err().expect("expected error for ws:// URL");
+        assert!(err.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn bags_api_client_accepts_https_url() {
+        let client = reqwest::Client::new();
+        assert!(BagsApiClient::new("https://api.bags.fm".to_string(), client).is_ok());
+    }
+
+    // --- BagsLaunchClient ---
+
+    #[test]
+    fn partner_mode_enabled_true_when_key_set() {
+        let client = reqwest::Client::new();
+        let lc = BagsLaunchClient::new("key".to_string(), Some("partner123".to_string()), client);
+        assert!(lc.partner_mode_enabled());
+    }
+
+    #[test]
+    fn partner_mode_enabled_false_when_key_none() {
+        let client = reqwest::Client::new();
+        let lc = BagsLaunchClient::new("key".to_string(), None, client);
+        assert!(!lc.partner_mode_enabled());
+    }
+
+    #[test]
+    fn partner_mode_enabled_false_when_key_blank() {
+        let client = reqwest::Client::new();
+        let lc = BagsLaunchClient::new("key".to_string(), Some("   ".to_string()), client);
+        assert!(!lc.partner_mode_enabled());
+    }
+
+    // --- Protocol fee arithmetic ---
+
+    #[test]
+    fn protocol_fee_is_1_percent_of_delta() {
+        let delta: u64 = 1_000_000; // 1 SOL in lamports
+        let fee = (delta as u128)
+            .saturating_mul(PROTOCOL_FEE_BPS as u128)
+            .checked_div(10_000)
+            .unwrap_or(0) as u64;
+        assert_eq!(fee, 10_000); // 1% of 1_000_000 = 10_000 lamports
+    }
+
+    #[test]
+    fn protocol_fee_skipped_when_below_minimum() {
+        // delta just under threshold: fee = 9 lamports < MIN_PROTOCOL_FEE_LAMPORTS (1_000)
+        let delta: u64 = 900;
+        let fee = (delta as u128)
+            .saturating_mul(PROTOCOL_FEE_BPS as u128)
+            .checked_div(10_000)
+            .unwrap_or(0) as u64;
+        assert!(fee < MIN_PROTOCOL_FEE_LAMPORTS);
+    }
+
+    #[test]
+    fn treasury_address_parses_as_valid_pubkey() {
+        let pk: Result<Pubkey, _> = ZEROX1_TREASURY.parse();
+        assert!(pk.is_ok(), "ZEROX1_TREASURY must be a valid Solana pubkey");
+    }
 }

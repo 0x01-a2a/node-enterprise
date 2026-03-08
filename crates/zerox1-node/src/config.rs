@@ -232,6 +232,13 @@ pub struct Config {
     #[arg(long, env = "ZX01_BAGS_API_KEY")]
     pub bags_api_key: Option<String>,
 
+    /// Optional Bags partner key for partner-attributed launches.
+    /// When set, the launch client includes partner metadata on token launch
+    /// requests and the node skips the legacy post-claim SOL protocol fee skim.
+    #[cfg(feature = "bags")]
+    #[arg(long, env = "ZX01_BAGS_PARTNER_KEY")]
+    pub bags_partner_key: Option<String>,
+
     /// Solana RPC endpoint for trading operations (Jupiter swaps, Bags fee distribution,
     /// USDC hot-wallet sweep).  Defaults to mainnet so financial operations are always
     /// on the real network regardless of the mesh --rpc-url (which defaults to devnet).
@@ -250,6 +257,140 @@ pub struct Config {
     /// On Android this is set to {filesDir}/zw by NodeService.
     #[arg(long, env = "ZX01_SKILL_WORKSPACE")]
     pub skill_workspace: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn base_config() -> Config {
+        Config::try_parse_from(["zerox1-node"]).expect("default config parses")
+    }
+
+    // --- sati_mint_bytes ---
+
+    #[test]
+    fn sati_mint_bytes_none_when_absent() {
+        assert!(base_config().sati_mint_bytes().unwrap().is_none());
+    }
+
+    #[test]
+    fn sati_mint_bytes_parses_base58() {
+        // Devnet USDC mint — well-known 32-byte pubkey
+        let mut cfg = base_config();
+        cfg.sati_mint = Some("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU".to_string());
+        let bytes = cfg.sati_mint_bytes().unwrap().unwrap();
+        assert_eq!(bytes.len(), 32);
+        // Round-trip: bytes should match bs58 decode of the same string
+        let expected = bs58::decode("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU")
+            .into_vec()
+            .unwrap();
+        assert_eq!(&bytes[..], expected.as_slice());
+    }
+
+    #[test]
+    fn sati_mint_bytes_parses_64_char_hex() {
+        let mut cfg = base_config();
+        cfg.sati_mint = Some("aa".repeat(32)); // 64 hex chars = 32 bytes
+        let bytes = cfg.sati_mint_bytes().unwrap().unwrap();
+        assert_eq!(bytes, [0xaa_u8; 32]);
+    }
+
+    #[test]
+    fn sati_mint_bytes_parses_0x_prefixed_hex() {
+        let mut cfg = base_config();
+        cfg.sati_mint = Some(format!("0x{}", "bb".repeat(32)));
+        let bytes = cfg.sati_mint_bytes().unwrap().unwrap();
+        assert_eq!(bytes, [0xbb_u8; 32]);
+    }
+
+    #[test]
+    fn sati_mint_bytes_rejects_invalid_base58() {
+        let mut cfg = base_config();
+        cfg.sati_mint = Some("not!valid@address".to_string());
+        assert!(cfg.sati_mint_bytes().is_err());
+    }
+
+    #[test]
+    fn sati_mint_bytes_rejects_wrong_length_hex() {
+        let mut cfg = base_config();
+        // 0x-prefix → hex path, but only 16 bytes → should fail try_into
+        cfg.sati_mint = Some(format!("0x{}", "aa".repeat(16)));
+        assert!(cfg.sati_mint_bytes().is_err());
+    }
+
+    #[test]
+    fn sati_mint_bytes_whitespace_trimmed() {
+        let mut cfg = base_config();
+        cfg.sati_mint = Some(format!("  {}  ", "cc".repeat(32)));
+        let bytes = cfg.sati_mint_bytes().unwrap().unwrap();
+        assert_eq!(bytes, [0xcc_u8; 32]);
+    }
+
+    // --- all_bootstrap_peers ---
+
+    #[test]
+    fn bootstrap_returns_4_defaults_by_default() {
+        let cfg = base_config();
+        assert_eq!(cfg.all_bootstrap_peers().len(), 4);
+    }
+
+    #[test]
+    fn bootstrap_empty_when_no_default_bootstrap() {
+        let cfg = Config::try_parse_from(["zerox1-node", "--no-default-bootstrap"]).unwrap();
+        assert_eq!(cfg.all_bootstrap_peers().len(), 0);
+    }
+
+    #[test]
+    fn bootstrap_merges_user_peer_with_defaults() {
+        let cfg = Config::try_parse_from([
+            "zerox1-node",
+            "--bootstrap",
+            "/ip4/1.2.3.4/tcp/9000",
+        ])
+        .unwrap();
+        // 1 user peer + 4 defaults
+        assert_eq!(cfg.all_bootstrap_peers().len(), 5);
+    }
+
+    #[test]
+    fn bootstrap_user_peer_only_when_no_defaults() {
+        let cfg = Config::try_parse_from([
+            "zerox1-node",
+            "--no-default-bootstrap",
+            "--bootstrap",
+            "/ip4/1.2.3.4/tcp/9000",
+        ])
+        .unwrap();
+        assert_eq!(cfg.all_bootstrap_peers().len(), 1);
+    }
+
+    // --- usdc_mint_pubkey ---
+
+    #[test]
+    fn usdc_mint_pubkey_none_when_absent() {
+        assert!(base_config().usdc_mint_pubkey().unwrap().is_none());
+    }
+
+    #[test]
+    fn usdc_mint_pubkey_parses_devnet_address() {
+        let cfg = Config::try_parse_from([
+            "zerox1-node",
+            "--usdc-mint",
+            "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+        ])
+        .unwrap();
+        let pk = cfg.usdc_mint_pubkey().unwrap().unwrap();
+        assert_eq!(pk.to_string(), "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+    }
+
+    #[test]
+    fn usdc_mint_pubkey_rejects_garbage() {
+        let mut cfg = base_config();
+        cfg.usdc_mint = Some("not-a-valid-pubkey!!!".to_string());
+        assert!(cfg.usdc_mint_pubkey().is_err());
+    }
 }
 
 impl Config {

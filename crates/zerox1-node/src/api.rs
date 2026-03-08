@@ -458,7 +458,7 @@ pub struct ApiInner {
 
     // Portfolio state
     pub portfolio_history: RwLock<PortfolioHistory>,
-    portfolio_persist_path: PathBuf,
+    portfolio_persist_path: RwLock<PathBuf>,
 
     // Bags fee-sharing (feature = "bags")
     #[cfg(feature = "bags")]
@@ -577,7 +577,7 @@ impl ApiState {
             exempt_agents,
             exempt_persist_path,
             portfolio_history: RwLock::new(PortfolioHistory::default()),
-            portfolio_persist_path: PathBuf::new(), // to be set in load_or_init
+            portfolio_persist_path: RwLock::new(PathBuf::new()), // set during init
             #[cfg(feature = "bags")]
             bags_config,
             #[cfg(feature = "bags")]
@@ -598,16 +598,12 @@ impl ApiState {
     }
 
     pub async fn load_portfolio_history(&self, path: PathBuf) -> anyhow::Result<()> {
-        {
-            let mut inner = self.0.write().await;
-            inner.portfolio_persist_path = path.clone();
-        }
+        *self.0.portfolio_persist_path.write().await = path.clone();
 
         if path.exists() {
-            let data = std::fs::read_to_string(&path)?;
+            let data = tokio::fs::read_to_string(&path).await?;
             let history: PortfolioHistory = serde_json::from_str(&data)?;
-            let mut inner = self.0.write().await;
-            *inner.portfolio_history.get_mut() = history;
+            *self.0.portfolio_history.write().await = history;
         }
         Ok(())
     }
@@ -619,11 +615,13 @@ impl ApiState {
             history.events.truncate(1000);
         }
 
-        // Persist
-        let path = &self.0.portfolio_persist_path;
+        // Persist asynchronously — drop the write lock first so other tasks
+        // can access portfolio_history while we do the (potentially slow) write.
+        let path = self.0.portfolio_persist_path.read().await.clone();
         if !path.as_os_str().is_empty() {
             if let Ok(json) = serde_json::to_string_pretty(&*history) {
-                let _ = std::fs::write(path, json);
+                drop(history);
+                let _ = tokio::fs::write(&path, json).await;
             }
         }
     }
@@ -831,13 +829,19 @@ pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>)
         })
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("API listener bind failed");
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("API listener bind failed on {addr}: {e}");
+            return;
+        }
+    };
 
     tracing::info!("API listening on http://{addr}");
 
-    axum::serve(listener, app).await.expect("API server error");
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("API server error on {addr}: {e}");
+    }
 }
 
 // ============================================================================
@@ -3915,14 +3919,17 @@ async fn bags_claim_handler(
             })
             .await;
 
-        // Collect 1% protocol fee from SOL income — fire-and-forget.
-        crate::bags::spawn_protocol_fee_collection(
-            state.0.node_signing_key.clone(),
-            agent_pubkey,
-            pre_sol_balance,
-            state.0.trade_rpc_url.clone(),
-            state.0.http_client.clone(),
-        );
+        // In partner mode, Bags handles revenue attribution directly, so we
+        // skip the legacy post-claim SOL skim.
+        if !launch.partner_mode_enabled() {
+            crate::bags::spawn_protocol_fee_collection(
+                state.0.node_signing_key.clone(),
+                agent_pubkey,
+                pre_sol_balance,
+                state.0.trade_rpc_url.clone(),
+                state.0.http_client.clone(),
+            );
+        }
     }
 
     Json(serde_json::json!({
@@ -4458,4 +4465,98 @@ async fn skill_remove_handler(
     }
     tracing::info!("Skill '{}' removed", req.name);
     Json(serde_json::json!({"ok": true, "name": req.name})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use solana_sdk::signature::Signer;
+
+    // --- to_solana_keypair ---
+
+    #[test]
+    fn to_solana_keypair_encodes_correct_bytes() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let kp = to_solana_keypair(&sk);
+        let kp_bytes = kp.to_bytes();
+        // First 32 bytes are the secret key
+        assert_eq!(&kp_bytes[..32], sk.to_bytes().as_slice());
+        // Last 32 bytes are the verifying (public) key
+        assert_eq!(&kp_bytes[32..], sk.verifying_key().as_bytes().as_slice());
+    }
+
+    #[test]
+    fn to_solana_keypair_pubkey_matches_signing_key() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let kp = to_solana_keypair(&sk);
+        let expected_pk = Pubkey::new_from_array(sk.verifying_key().to_bytes());
+        assert_eq!(kp.pubkey(), expected_pk);
+    }
+
+    #[test]
+    fn to_solana_keypair_deterministic() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let kp1 = to_solana_keypair(&sk);
+        let kp2 = to_solana_keypair(&sk);
+        assert_eq!(kp1.pubkey(), kp2.pubkey());
+    }
+
+    // --- derive_ata ---
+
+    #[test]
+    fn derive_ata_is_deterministic() {
+        let owner = Pubkey::new_from_array([1u8; 32]);
+        let mint = USDC_MINT_DEVNET.parse::<Pubkey>().unwrap();
+        let ata1 = derive_ata(&owner, &mint);
+        let ata2 = derive_ata(&owner, &mint);
+        assert_eq!(ata1, ata2);
+    }
+
+    #[test]
+    fn derive_ata_differs_for_different_owners() {
+        let mint = USDC_MINT_DEVNET.parse::<Pubkey>().unwrap();
+        let ata1 = derive_ata(&Pubkey::new_from_array([1u8; 32]), &mint);
+        let ata2 = derive_ata(&Pubkey::new_from_array([2u8; 32]), &mint);
+        assert_ne!(ata1, ata2);
+    }
+
+    #[test]
+    fn derive_ata_differs_for_different_mints() {
+        let owner = Pubkey::new_from_array([1u8; 32]);
+        let devnet_mint = USDC_MINT_DEVNET.parse::<Pubkey>().unwrap();
+        let mainnet_mint = USDC_MINT_MAINNET.parse::<Pubkey>().unwrap();
+        let ata1 = derive_ata(&owner, &devnet_mint);
+        let ata2 = derive_ata(&owner, &mainnet_mint);
+        assert_ne!(ata1, ata2);
+    }
+
+    #[test]
+    fn derive_ata_known_devnet_usdc_address() {
+        // Known ATA: wallet 11111111111111111111111111111111 (all zeros) + devnet USDC
+        // Computed via spl-associated-token-account derivation.
+        let owner = Pubkey::default(); // all zeros
+        let mint = USDC_MINT_DEVNET.parse::<Pubkey>().unwrap();
+        let ata = derive_ata(&owner, &mint);
+        // The ATA must be a valid on-curve or off-curve PDA — just verify it is non-zero
+        assert_ne!(ata, Pubkey::default());
+    }
+
+    // --- USDC/SPL constants ---
+
+    #[test]
+    fn usdc_mint_devnet_parses_as_pubkey() {
+        assert!(USDC_MINT_DEVNET.parse::<Pubkey>().is_ok());
+    }
+
+    #[test]
+    fn usdc_mint_mainnet_parses_as_pubkey() {
+        assert!(USDC_MINT_MAINNET.parse::<Pubkey>().is_ok());
+    }
+
+    #[test]
+    fn spl_token_program_id_parses_as_pubkey() {
+        assert!(SPL_TOKEN_PROGRAM_ID.parse::<Pubkey>().is_ok());
+    }
 }

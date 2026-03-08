@@ -1,3 +1,12 @@
+// The trade feature bundles Jupiter swap routing, USDC portfolio tracking, and
+// Bags fee distribution — functionality that only makes sense on always-on
+// mobile nodes (Android). Enabling it on server or desktop builds is a mistake.
+#[cfg(not(target_os = "android"))]
+compile_error!(
+    "feature \"trade\" may only be enabled for Android targets \
+     (target_os = \"android\"). Use `cargo ndk --target aarch64-linux-android`."
+);
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
