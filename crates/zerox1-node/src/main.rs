@@ -76,6 +76,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut node = node::Zx01Node::new(config, identity, bootstrap_peers)?;
+    let mut node = node::Zx01Node::new(config, identity, bootstrap_peers).await?;
     node.run(&mut swarm).await
 }

@@ -14,10 +14,10 @@
     "ws": "^8.18.0"
   },
   "optionalDependencies": {
-    "@zerox1/sdk-darwin-arm64": "0.2.20",
-    "@zerox1/sdk-darwin-x64": "0.2.20",
-    "@zerox1/sdk-linux-x64": "0.2.20",
-    "@zerox1/sdk-win32-x64": "0.2.20"
+    "@zerox1/sdk-darwin-arm64": "0.2.16",
+    "@zerox1/sdk-darwin-x64": "0.2.16",
+    "@zerox1/sdk-linux-x64": "0.2.16",
+    "@zerox1/sdk-win32-x64": "0.2.16"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

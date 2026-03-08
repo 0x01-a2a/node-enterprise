@@ -152,7 +152,7 @@ pub struct Zx01Node {
 }
 
 impl Zx01Node {
-    pub fn new(
+    pub async fn new(
         mut config: Config,
         identity: AgentIdentity,
         bootstrap_peers: Vec<libp2p::Multiaddr>,
@@ -242,10 +242,7 @@ impl Zx01Node {
                         config.bags_api_url.clone(),
                         http_client.clone(),
                     )?;
-                    tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(api_client.resolve_distribution_address())
-                    })
+                    api_client.resolve_distribution_address().await
                     .map_err(|e| {
                         anyhow::anyhow!("Bags API unavailable and --bags-wallet not set: {e}")
                     })?
@@ -296,8 +293,7 @@ impl Zx01Node {
 
         // Load portfolio history from disk
         let portfolio_path = config.log_dir.join("portfolio_history.json");
-        let _ =
-            tokio::runtime::Handle::current().block_on(api.load_portfolio_history(portfolio_path));
+        let _ = api.load_portfolio_history(portfolio_path).await;
 
         let batch = BatchAccumulator::new(epoch, 0);
         let logger = EnvelopeLogger::new(log_dir, epoch);
