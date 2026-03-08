@@ -1,6 +1,6 @@
 {
   "name": "@zerox1/sdk-darwin-arm64",
-  "version": "0.2.20",
+  "version": "0.2.21",
   "description": "zerox1-node binary for macOS ARM64 (Apple Silicon)",
   "os": [
     "darwin"
