@@ -1,8 +1,10 @@
 mod api;
-mod constants;
+#[cfg(feature = "bags")]
+pub mod bags;
 mod batch;
 mod challenge;
 mod config;
+mod constants;
 mod escrow;
 mod identity;
 mod inactive;
@@ -14,13 +16,11 @@ mod node;
 mod peer_state;
 mod push_notary;
 mod registry_8004;
-#[cfg(feature = "trade")]
-pub mod trade;
-#[cfg(feature = "bags")]
-pub mod bags;
 mod reputation;
 mod stake_lock;
 mod submit;
+#[cfg(feature = "trade")]
+pub mod trade;
 
 use clap::Parser;
 

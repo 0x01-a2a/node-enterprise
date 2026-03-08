@@ -161,6 +161,20 @@ pub enum PortfolioEvent {
         txid: String,
         timestamp: u64,
     },
+    #[cfg(feature = "bags")]
+    BagsLaunch {
+        token_mint: String,
+        name: String,
+        symbol: String,
+        txid: String,
+        timestamp: u64,
+    },
+    #[cfg(feature = "bags")]
+    BagsClaim {
+        token_mint: String,
+        claimed_txs: usize,
+        timestamp: u64,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -415,12 +429,18 @@ pub struct ApiInner {
     // 8004 registry helpers
     /// Solana RPC URL — used by registry endpoints for blockhash + broadcast.
     pub rpc_url: String,
+    /// Solana RPC URL for trading (Jupiter swaps, Bags fees, USDC sweep).
+    /// Defaults to mainnet so financial ops are on real network even when
+    /// mesh rpc_url points at devnet.
+    pub trade_rpc_url: String,
     /// Node's own Ed25519 signing key — used for /wallet/sweep.
     pub node_signing_key: Arc<SigningKey>,
     /// Shared HTTP client for registry RPC calls.
     pub(crate) http_client: reqwest::Client,
     /// Whether this node is pointed at mainnet-beta (affects 8004 program IDs).
     pub(crate) is_mainnet: bool,
+    /// Whether trade_rpc_url points at mainnet-beta (affects USDC mint selection).
+    pub(crate) is_trading_mainnet: bool,
     /// Kora paymaster client — present when --kora-url is configured.
     pub kora: Option<KoraClient>,
     /// Optional override for the 8004 base collection (required on mainnet).
@@ -440,6 +460,21 @@ pub struct ApiInner {
     // Bags fee-sharing (feature = "bags")
     #[cfg(feature = "bags")]
     pub bags_config: Option<Arc<crate::bags::BagsConfig>>,
+
+    // Bags token launch (feature = "bags")
+    #[cfg(feature = "bags")]
+    pub bags_launch: Option<Arc<crate::bags::BagsLaunchClient>>,
+
+    // Agent (zeroclaw) process management
+    /// PID of the running zeroclaw agent process. Set by POST /agent/register-pid.
+    /// Used by POST /agent/reload to restart the agent so new skills are loaded.
+    pub agent_pid: Mutex<Option<u32>>,
+    /// Rate limit for POST /agent/reload — max 3 reloads per minute.
+    agent_reload_rate_limit: Mutex<RateLimitWindow>,
+
+    // Skill manager
+    /// Zeroclaw workspace directory. When set, skill management endpoints are active.
+    pub skill_workspace: Option<std::path::PathBuf>,
 }
 
 /// Cheaply cloneable shared state passed to all axum handlers.
@@ -463,6 +498,7 @@ impl ApiState {
         api_read_keys: Vec<String>,
         hosting_fee_bps: u32,
         rpc_url: String,
+        trade_rpc_url: String,
         http_client: reqwest::Client,
         registry_8004_collection: Option<String>,
         node_signing_key: Arc<SigningKey>,
@@ -470,12 +506,21 @@ impl ApiState {
         exempt_agents: Arc<std::sync::RwLock<HashSet<[u8; 32]>>>,
         exempt_persist_path: PathBuf,
         #[cfg(feature = "bags")] bags_config: Option<Arc<crate::bags::BagsConfig>>,
+        #[cfg(feature = "bags")] bags_launch: Option<Arc<crate::bags::BagsLaunchClient>>,
+        skill_workspace: Option<std::path::PathBuf>,
     ) -> (
         Self,
         mpsc::Receiver<OutboundRequest>,
         mpsc::Receiver<Envelope>,
     ) {
-        let is_mainnet = rpc_url.contains("mainnet-beta");
+        let is_mainnet = !rpc_url.contains("devnet")
+            && !rpc_url.contains("testnet")
+            && !rpc_url.contains("localhost")
+            && !rpc_url.contains("127.0.0.1");
+        let is_trading_mainnet = !trade_rpc_url.contains("devnet")
+            && !trade_rpc_url.contains("testnet")
+            && !trade_rpc_url.contains("localhost")
+            && !trade_rpc_url.contains("127.0.0.1");
         let (event_tx, _) = broadcast::channel(512);
         let (inbox_tx, _) = broadcast::channel(256);
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
@@ -516,9 +561,11 @@ impl ApiState {
                 count: 0,
             }),
             rpc_url,
+            trade_rpc_url,
             node_signing_key,
             http_client,
             is_mainnet,
+            is_trading_mainnet,
             kora,
             registry_8004_collection,
             current_slot: core::sync::atomic::AtomicU64::new(0),
@@ -528,6 +575,14 @@ impl ApiState {
             portfolio_persist_path: PathBuf::new(), // to be set in load_or_init
             #[cfg(feature = "bags")]
             bags_config,
+            #[cfg(feature = "bags")]
+            bags_launch,
+            agent_pid: Mutex::new(None),
+            agent_reload_rate_limit: Mutex::new(RateLimitWindow {
+                window_start: now_secs(),
+                count: 0,
+            }),
+            skill_workspace,
         }));
 
         (state, outbound_rx, hosted_outbound_rx)
@@ -586,11 +641,15 @@ impl ApiState {
     }
 
     pub fn set_current_slot(&self, slot: u64) {
-        self.0.current_slot.store(slot, core::sync::atomic::Ordering::Relaxed);
+        self.0
+            .current_slot
+            .store(slot, core::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn get_current_slot(&self) -> u64 {
-        self.0.current_slot.load(core::sync::atomic::Ordering::Relaxed)
+        self.0
+            .current_slot
+            .load(core::sync::atomic::Ordering::Relaxed)
     }
 
     // ── Agent integration helpers ─────────────────────────────────────────────
@@ -692,16 +751,33 @@ pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>)
         .route("/ws/hosted/inbox", get(ws_hosted_inbox_handler))
         // 8004 Solana Agent Registry helpers
         .route("/registry/8004/info", get(registry_8004_info))
-        .route("/registry/8004/register-prepare", post(registry_8004_register_prepare))
-        .route("/registry/8004/register-submit", post(registry_8004_register_submit))
+        .route(
+            "/registry/8004/register-prepare",
+            post(registry_8004_register_prepare),
+        )
+        .route(
+            "/registry/8004/register-submit",
+            post(registry_8004_register_submit),
+        )
         // Escrow
         .route("/escrow/lock", post(escrow_lock))
         .route("/escrow/approve", post(escrow_approve))
         // Hot wallet sweep
         .route("/wallet/sweep", post(sweep_usdc))
         // Admin — exempt agent management (loopback only; requires api_secret)
-        .route("/admin/exempt", get(admin_exempt_list).post(admin_exempt_add))
-        .route("/admin/exempt/{agent_id}", delete(admin_exempt_remove));
+        .route(
+            "/admin/exempt",
+            get(admin_exempt_list).post(admin_exempt_add),
+        )
+        .route("/admin/exempt/{agent_id}", delete(admin_exempt_remove))
+        // Agent process management (skill hot-reload)
+        .route("/agent/register-pid", post(agent_register_pid))
+        .route("/agent/reload", post(agent_reload))
+        // Skill manager — safe Rust-side file operations (no shell injection)
+        .route("/skill/list", get(skill_list_handler))
+        .route("/skill/write", post(skill_write_handler))
+        .route("/skill/install-url", post(skill_install_url_handler))
+        .route("/skill/remove", post(skill_remove_handler));
 
     #[cfg(feature = "trade")]
     let router = router
@@ -717,9 +793,13 @@ pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>)
 
     #[cfg(feature = "bags")]
     let router = router
-        .route("/bags/config", get(bags_config_handler));
+        .route("/bags/config", get(bags_config_handler))
+        .route("/bags/launch", post(bags_launch_handler))
+        .route("/bags/claim", post(bags_claim_handler))
+        .route("/bags/positions", get(bags_positions_handler));
 
-    let app = router.layer({
+    let app = router
+        .layer({
             let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
                 // Default: loopback only (zeroclaw, React Native WebView).
                 vec![
@@ -746,9 +826,7 @@ pub async fn serve(state: ApiState, addr: SocketAddr, cors_origins: Vec<String>)
 
     tracing::info!("API listening on http://{addr}");
 
-    axum::serve(listener, app)
-        .await
-        .expect("API server error");
+    axum::serve(listener, app).await.expect("API server error");
 }
 
 // ============================================================================
@@ -951,8 +1029,7 @@ async fn send_envelope(
     };
 
     // Guard against oversized payloads before decoding — base64 of 64 KB ≈ 88 KB.
-    const MAX_PAYLOAD_B64_LEN: usize =
-        (zerox1_protocol::constants::MAX_MESSAGE_SIZE / 3 + 1) * 4;
+    const MAX_PAYLOAD_B64_LEN: usize = (zerox1_protocol::constants::MAX_MESSAGE_SIZE / 3 + 1) * 4;
     if req.payload_b64.len() > MAX_PAYLOAD_B64_LEN {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1048,47 +1125,95 @@ async fn negotiate_propose(
     Json(req): Json<NegotiateProposeRequest>,
 ) -> impl IntoResponse {
     if require_api_secret_or_unauthorized(&state, &headers).is_some() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
     }
     {
         let now = now_secs();
         let mut rl = state.0.send_rate_limit.lock().await;
-        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
         if rl.count >= MAX_API_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded" })),
+            );
         }
         rl.count += 1;
     }
-    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+    let recipient: [u8; 32] = match hex::decode(&req.recipient)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" })),
+            )
+        }
     };
     let (conv_id_hex, conversation_id) = match req.conversation_id {
         Some(ref s) => match hex::decode(s).ok().and_then(|b| b.try_into().ok()) {
             Some(a) => (s.clone(), a),
-            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                    ),
+                )
+            }
         },
-        None => { let b = rand::random::<[u8; 16]>(); (hex::encode(b), b) },
+        None => {
+            let b = rand::random::<[u8; 16]>();
+            (hex::encode(b), b)
+        }
     };
     let amount = req.amount_usdc_micro.unwrap_or(0);
     let max_rounds = req.max_rounds.unwrap_or(2);
-    let payload = build_negotiate_payload(amount, serde_json::json!({
-        "max_rounds": max_rounds,
-        "message": req.message,
-    }));
+    let payload = build_negotiate_payload(
+        amount,
+        serde_json::json!({
+            "max_rounds": max_rounds,
+            "message": req.message,
+        }),
+    );
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let outbound = OutboundRequest { msg_type: MsgType::Propose, recipient, conversation_id, payload, reply: reply_tx };
+    let outbound = OutboundRequest {
+        msg_type: MsgType::Propose,
+        recipient,
+        conversation_id,
+        payload,
+        reply: reply_tx,
+    };
     if state.send_outbound(outbound).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "node loop unavailable" })),
+        );
     }
     match reply_rx.await {
-        Ok(Ok(conf)) => (StatusCode::OK, Json(serde_json::json!({
-            "conversation_id": conv_id_hex,
-            "nonce": conf.nonce,
-            "payload_hash": conf.payload_hash,
-        }))),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "node loop dropped reply" }))),
+        Ok(Ok(conf)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "conversation_id": conv_id_hex,
+                "nonce": conf.nonce,
+                "payload_hash": conf.payload_hash,
+            })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "node loop dropped reply" })),
+        ),
     }
 }
 
@@ -1099,45 +1224,96 @@ async fn negotiate_counter(
     Json(req): Json<NegotiateCounterRequest>,
 ) -> impl IntoResponse {
     if require_api_secret_or_unauthorized(&state, &headers).is_some() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
     }
     {
         let now = now_secs();
         let mut rl = state.0.send_rate_limit.lock().await;
-        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
         if rl.count >= MAX_API_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded" })),
+            );
         }
         rl.count += 1;
     }
     let max_rounds = req.max_rounds.unwrap_or(2);
     if req.round == 0 || req.round > max_rounds {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("round {} is out of range [1, {}]", req.round, max_rounds)
-        })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("round {} is out of range [1, {}]", req.round, max_rounds)
+            })),
+        );
     }
-    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+    let recipient: [u8; 32] = match hex::decode(&req.recipient)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" })),
+            )
+        }
     };
-    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                ),
+            )
+        }
     };
-    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
-        "round": req.round,
-        "max_rounds": max_rounds,
-        "message": req.message.unwrap_or_default(),
-    }));
+    let payload = build_negotiate_payload(
+        req.amount_usdc_micro,
+        serde_json::json!({
+            "round": req.round,
+            "max_rounds": max_rounds,
+            "message": req.message.unwrap_or_default(),
+        }),
+    );
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let outbound = OutboundRequest { msg_type: MsgType::Counter, recipient, conversation_id, payload, reply: reply_tx };
+    let outbound = OutboundRequest {
+        msg_type: MsgType::Counter,
+        recipient,
+        conversation_id,
+        payload,
+        reply: reply_tx,
+    };
     if state.send_outbound(outbound).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "node loop unavailable" })),
+        );
     }
     match reply_rx.await {
-        Ok(Ok(conf)) => (StatusCode::OK, Json(serde_json::to_value(conf).unwrap_or_default())),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "node loop dropped reply" }))),
+        Ok(Ok(conf)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(conf).unwrap_or_default()),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "node loop dropped reply" })),
+        ),
     }
 }
 
@@ -1148,37 +1324,85 @@ async fn negotiate_accept(
     Json(req): Json<NegotiateAcceptRequest>,
 ) -> impl IntoResponse {
     if require_api_secret_or_unauthorized(&state, &headers).is_some() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
     }
     {
         let now = now_secs();
         let mut rl = state.0.send_rate_limit.lock().await;
-        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
         if rl.count >= MAX_API_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded" })),
+            );
         }
         rl.count += 1;
     }
-    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+    let recipient: [u8; 32] = match hex::decode(&req.recipient)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" })),
+            )
+        }
     };
-    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                ),
+            )
+        }
     };
-    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
-        "message": req.message.unwrap_or_default(),
-    }));
+    let payload = build_negotiate_payload(
+        req.amount_usdc_micro,
+        serde_json::json!({
+            "message": req.message.unwrap_or_default(),
+        }),
+    );
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    let outbound = OutboundRequest { msg_type: MsgType::Accept, recipient, conversation_id, payload, reply: reply_tx };
+    let outbound = OutboundRequest {
+        msg_type: MsgType::Accept,
+        recipient,
+        conversation_id,
+        payload,
+        reply: reply_tx,
+    };
     if state.send_outbound(outbound).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "node loop unavailable" })),
+        );
     }
     match reply_rx.await {
-        Ok(Ok(conf)) => (StatusCode::OK, Json(serde_json::to_value(conf).unwrap_or_default())),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": "node loop dropped reply" }))),
+        Ok(Ok(conf)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(conf).unwrap_or_default()),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "node loop dropped reply" })),
+        ),
     }
 }
 
@@ -1446,57 +1670,118 @@ async fn hosted_negotiate_propose(
 ) -> impl IntoResponse {
     let token = match resolve_hosted_token(&headers) {
         Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "missing Bearer token" }))),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "missing Bearer token" })),
+            )
+        }
     };
     {
         let now = now_secs();
         let mut rl = state.0.hosted_send_rate_limit.lock().await;
-        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
         if rl.count >= MAX_HOSTED_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })),
+            );
         }
         rl.count += 1;
     }
-    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+    let recipient: [u8; 32] = match hex::decode(&req.recipient)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" })),
+            )
+        }
     };
     let (conv_id_hex, conversation_id) = match req.conversation_id {
         Some(ref s) => match hex::decode(s).ok().and_then(|b| b.try_into().ok()) {
             Some(a) => (s.clone(), a),
-            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                    ),
+                )
+            }
         },
-        None => { let b = rand::random::<[u8; 16]>(); (hex::encode(b), b) },
+        None => {
+            let b = rand::random::<[u8; 16]>();
+            (hex::encode(b), b)
+        }
     };
     let amount = req.amount_usdc_micro.unwrap_or(0);
     let max_rounds = req.max_rounds.unwrap_or(2);
-    let payload = build_negotiate_payload(amount, serde_json::json!({
-        "max_rounds": max_rounds,
-        "message": req.message,
-    }));
+    let payload = build_negotiate_payload(
+        amount,
+        serde_json::json!({
+            "max_rounds": max_rounds,
+            "message": req.message,
+        }),
+    );
     let env = {
         let now = now_secs();
         let mut sessions = state.0.hosted_sessions.write().await;
         let session = match sessions.get_mut(&token) {
             Some(s) => s,
-            None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid token" }))),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "invalid token" })),
+                )
+            }
         };
         if now.saturating_sub(session.created_at) >= SESSION_TTL_SECS {
             sessions.remove(&token);
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "session expired" })));
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "session expired" })),
+            );
         }
-        if now.saturating_sub(session.rate_window_start) >= 60 { session.rate_window_start = now; session.sends_in_window = 0; }
+        if now.saturating_sub(session.rate_window_start) >= 60 {
+            session.rate_window_start = now;
+            session.sends_in_window = 0;
+        }
         session.sends_in_window += 1;
         if session.sends_in_window > MAX_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded" })),
+            );
         }
         session.nonce += 1;
-        Envelope::build(MsgType::Propose, session.agent_id, recipient, state.get_current_slot(), session.nonce, conversation_id, payload, &session.signing_key)
+        Envelope::build(
+            MsgType::Propose,
+            session.agent_id,
+            recipient,
+            state.get_current_slot(),
+            session.nonce,
+            conversation_id,
+            payload,
+            &session.signing_key,
+        )
     };
     if state.send_hosted_outbound(env).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "node loop unavailable" })),
+        );
     }
-    (StatusCode::OK, Json(serde_json::json!({ "conversation_id": conv_id_hex })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "conversation_id": conv_id_hex })),
+    )
 }
 
 /// POST /hosted/negotiate/counter — `Authorization: Bearer <token>`.
@@ -1507,57 +1792,118 @@ async fn hosted_negotiate_counter(
 ) -> impl IntoResponse {
     let token = match resolve_hosted_token(&headers) {
         Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "missing Bearer token" }))),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "missing Bearer token" })),
+            )
+        }
     };
     {
         let now = now_secs();
         let mut rl = state.0.hosted_send_rate_limit.lock().await;
-        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
         if rl.count >= MAX_HOSTED_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })),
+            );
         }
         rl.count += 1;
     }
     let max_rounds = req.max_rounds.unwrap_or(2);
     if req.round == 0 || req.round > max_rounds {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("round {} is out of range [1, {}]", req.round, max_rounds)
-        })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("round {} is out of range [1, {}]", req.round, max_rounds)
+            })),
+        );
     }
-    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+    let recipient: [u8; 32] = match hex::decode(&req.recipient)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" })),
+            )
+        }
     };
-    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                ),
+            )
+        }
     };
-    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
-        "round": req.round,
-        "max_rounds": max_rounds,
-        "message": req.message.unwrap_or_default(),
-    }));
+    let payload = build_negotiate_payload(
+        req.amount_usdc_micro,
+        serde_json::json!({
+            "round": req.round,
+            "max_rounds": max_rounds,
+            "message": req.message.unwrap_or_default(),
+        }),
+    );
     let env = {
         let now = now_secs();
         let mut sessions = state.0.hosted_sessions.write().await;
         let session = match sessions.get_mut(&token) {
             Some(s) => s,
-            None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid token" }))),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "invalid token" })),
+                )
+            }
         };
         if now.saturating_sub(session.created_at) >= SESSION_TTL_SECS {
             sessions.remove(&token);
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "session expired" })));
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "session expired" })),
+            );
         }
-        if now.saturating_sub(session.rate_window_start) >= 60 { session.rate_window_start = now; session.sends_in_window = 0; }
+        if now.saturating_sub(session.rate_window_start) >= 60 {
+            session.rate_window_start = now;
+            session.sends_in_window = 0;
+        }
         session.sends_in_window += 1;
         if session.sends_in_window > MAX_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded" })),
+            );
         }
         session.nonce += 1;
-        Envelope::build(MsgType::Counter, session.agent_id, recipient, state.get_current_slot(), session.nonce, conversation_id, payload, &session.signing_key)
+        Envelope::build(
+            MsgType::Counter,
+            session.agent_id,
+            recipient,
+            state.get_current_slot(),
+            session.nonce,
+            conversation_id,
+            payload,
+            &session.signing_key,
+        )
     };
     if state.send_hosted_outbound(env).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "node loop unavailable" })),
+        );
     }
     (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
 }
@@ -1570,49 +1916,107 @@ async fn hosted_negotiate_accept(
 ) -> impl IntoResponse {
     let token = match resolve_hosted_token(&headers) {
         Some(t) => t,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "missing Bearer token" }))),
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "missing Bearer token" })),
+            )
+        }
     };
     {
         let now = now_secs();
         let mut rl = state.0.hosted_send_rate_limit.lock().await;
-        if now.saturating_sub(rl.window_start) >= 60 { rl.window_start = now; rl.count = 0; }
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
         if rl.count >= MAX_HOSTED_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded — try again in 60s" })),
+            );
         }
         rl.count += 1;
     }
-    let recipient: [u8; 32] = match hex::decode(&req.recipient).ok().and_then(|b| b.try_into().ok()) {
+    let recipient: [u8; 32] = match hex::decode(&req.recipient)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "recipient: invalid hex or not 32 bytes" })),
+            )
+        }
     };
-    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id).ok().and_then(|b| b.try_into().ok()) {
+    let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                ),
+            )
+        }
     };
-    let payload = build_negotiate_payload(req.amount_usdc_micro, serde_json::json!({
-        "message": req.message.unwrap_or_default(),
-    }));
+    let payload = build_negotiate_payload(
+        req.amount_usdc_micro,
+        serde_json::json!({
+            "message": req.message.unwrap_or_default(),
+        }),
+    );
     let env = {
         let now = now_secs();
         let mut sessions = state.0.hosted_sessions.write().await;
         let session = match sessions.get_mut(&token) {
             Some(s) => s,
-            None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "invalid token" }))),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "invalid token" })),
+                )
+            }
         };
         if now.saturating_sub(session.created_at) >= SESSION_TTL_SECS {
             sessions.remove(&token);
-            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "session expired" })));
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "session expired" })),
+            );
         }
-        if now.saturating_sub(session.rate_window_start) >= 60 { session.rate_window_start = now; session.sends_in_window = 0; }
+        if now.saturating_sub(session.rate_window_start) >= 60 {
+            session.rate_window_start = now;
+            session.sends_in_window = 0;
+        }
         session.sends_in_window += 1;
         if session.sends_in_window > MAX_SENDS_PER_MINUTE {
-            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "rate limit exceeded" })));
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "rate limit exceeded" })),
+            );
         }
         session.nonce += 1;
-        Envelope::build(MsgType::Accept, session.agent_id, recipient, state.get_current_slot(), session.nonce, conversation_id, payload, &session.signing_key)
+        Envelope::build(
+            MsgType::Accept,
+            session.agent_id,
+            recipient,
+            state.get_current_slot(),
+            session.nonce,
+            conversation_id,
+            payload,
+            &session.signing_key,
+        )
     };
     if state.send_hosted_outbound(env).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({ "error": "node loop unavailable" })));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "node loop unavailable" })),
+        );
     }
     (StatusCode::NO_CONTENT, Json(serde_json::json!(null)))
 }
@@ -1747,7 +2151,10 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-pub(crate) fn require_api_secret_or_unauthorized(state: &ApiState, headers: &HeaderMap) -> Option<Response> {
+pub(crate) fn require_api_secret_or_unauthorized(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Option<Response> {
     let has_read_keys = !state.0.api_read_keys.is_empty();
     if let Some(ref secret) = state.0.api_secret {
         let provided = headers
@@ -1865,6 +2272,25 @@ pub(crate) fn resolve_hosted_token(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+#[cfg(feature = "trade")]
+pub(crate) async fn resolve_active_hosted_signing_key(
+    state: &ApiState,
+    token: &str,
+) -> Option<SigningKey> {
+    let now = now_secs();
+    let mut sessions = state.0.hosted_sessions.write().await;
+    match sessions.get(token) {
+        Some(session) if now.saturating_sub(session.created_at) < SESSION_TTL_SECS => {
+            Some(session.signing_key.clone())
+        }
+        Some(_) => {
+            sessions.remove(token);
+            None
+        }
+        None => None,
+    }
+}
+
 // ============================================================================
 // 8004 Solana Agent Registry — registration helpers
 // ============================================================================
@@ -1875,7 +2301,11 @@ pub(crate) fn resolve_hosted_token(headers: &HeaderMap) -> Option<String> {
 /// instructions an agent needs to self-register in the 8004 registry.
 /// No authentication required — this is public informational data.
 async fn registry_8004_info(State(state): State<ApiState>) -> Response {
-    let network = if state.0.is_mainnet { "mainnet-beta" } else { "devnet" };
+    let network = if state.0.is_mainnet {
+        "mainnet-beta"
+    } else {
+        "devnet"
+    };
     let program_id = if state.0.is_mainnet {
         PROGRAM_ID_MAINNET
     } else {
@@ -1885,7 +2315,11 @@ async fn registry_8004_info(State(state): State<ApiState>) -> Response {
         .0
         .registry_8004_collection
         .as_deref()
-        .unwrap_or(if state.0.is_mainnet { "(query RootConfig or set ZX01_REGISTRY_8004_COLLECTION)" } else { COLLECTION_DEVNET });
+        .unwrap_or(if state.0.is_mainnet {
+            "(query RootConfig or set ZX01_REGISTRY_8004_COLLECTION)"
+        } else {
+            COLLECTION_DEVNET
+        });
 
     Json(serde_json::json!({
         "network":     network,
@@ -2111,7 +2545,9 @@ async fn registry_8004_register_submit(
     if req.transaction_b64.len() > MAX_TX_B64_LEN {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({ "error": "transaction_b64: exceeds maximum transaction size" })),
+            Json(
+                serde_json::json!({ "error": "transaction_b64: exceeds maximum transaction size" }),
+            ),
         )
             .into_response();
     }
@@ -2128,17 +2564,18 @@ async fn registry_8004_register_submit(
         }
     };
 
-    let mut tx: solana_sdk::transaction::Transaction =
-        match bincode::deserialize(&tx_bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": format!("transaction deserialize failed: {e}") })),
-                )
-                    .into_response();
-            }
-        };
+    let mut tx: solana_sdk::transaction::Transaction = match bincode::deserialize(&tx_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": format!("transaction deserialize failed: {e}") }),
+                ),
+            )
+                .into_response();
+        }
+    };
 
     // The register tx must have exactly 2 signature slots: owner (index 0) + asset (index 1).
     // Also verify the fee payer is in account_keys[0] to prevent owner impersonation.
@@ -2176,13 +2613,13 @@ async fn registry_8004_register_submit(
     } else {
         crate::registry_8004::PROGRAM_ID_DEVNET
     };
-    
+
     let expected_program_id = program_id_str
         .parse::<solana_sdk::pubkey::Pubkey>()
         .expect("static program ID parses");
 
     let instruction_program_id = tx.message.instructions[0].program_id(&tx.message.account_keys);
-    
+
     if instruction_program_id != &expected_program_id {
         return (
             StatusCode::BAD_REQUEST,
@@ -2259,8 +2696,12 @@ pub(crate) fn to_solana_keypair(sk: &SigningKey) -> solana_sdk::signature::Keypa
 
 /// Derive the Associated Token Account address for a given owner and mint.
 pub(crate) fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
-    let spl_token: Pubkey = SPL_TOKEN_PROGRAM_ID.parse().expect("valid SPL_TOKEN_PROGRAM_ID");
-    let ata_program: Pubkey = SPL_ATA_PROGRAM_ID.parse().expect("valid SPL_ATA_PROGRAM_ID");
+    let spl_token: Pubkey = SPL_TOKEN_PROGRAM_ID
+        .parse()
+        .expect("valid SPL_TOKEN_PROGRAM_ID");
+    let ata_program: Pubkey = SPL_ATA_PROGRAM_ID
+        .parse()
+        .expect("valid SPL_ATA_PROGRAM_ID");
     Pubkey::find_program_address(
         &[&owner.to_bytes(), &spl_token.to_bytes(), &mint.to_bytes()],
         &ata_program,
@@ -2285,7 +2726,10 @@ async fn escrow_lock(
     Json(req): Json<EscrowLockRequest>,
 ) -> impl IntoResponse {
     if require_api_secret_or_unauthorized(&state, &headers).is_some() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
     }
 
     let provider_bytes: [u8; 32] = match hex::decode(&req.provider)
@@ -2293,7 +2737,12 @@ async fn escrow_lock(
         .and_then(|b| b.try_into().ok())
     {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "provider: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "provider: invalid hex or not 32 bytes" })),
+            )
+        }
     };
 
     let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
@@ -2301,20 +2750,35 @@ async fn escrow_lock(
         .and_then(|b| b.try_into().ok())
     {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                ),
+            )
+        }
     };
 
     let notary_pubkey: Option<solana_sdk::pubkey::Pubkey> = match req.notary {
         Some(ref hex_str) => match hex::decode(hex_str).ok().and_then(|b| b.try_into().ok()) {
             Some(bytes) => Some(solana_sdk::pubkey::Pubkey::new_from_array(bytes)),
-            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "notary: invalid hex or not 32 bytes" }))),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "notary: invalid hex or not 32 bytes" })),
+                )
+            }
         },
         None => None,
     };
 
     let amount = req.amount_usdc_micro;
     if amount == 0 {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "amount_usdc_micro must be > 0" })));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "amount_usdc_micro must be > 0" })),
+        );
     }
     let notary_fee = req.notary_fee.unwrap_or(amount / 10);
     let timeout_slots = req.timeout_slots.unwrap_or(1000);
@@ -2340,7 +2804,10 @@ async fn escrow_lock(
     .await
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -2354,7 +2821,10 @@ async fn escrow_approve(
     Json(req): Json<EscrowApproveRequest>,
 ) -> impl IntoResponse {
     if require_api_secret_or_unauthorized(&state, &headers).is_some() {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({ "error": "unauthorized" })));
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        );
     }
 
     let requester_bytes: [u8; 32] = match hex::decode(&req.requester)
@@ -2362,7 +2832,12 @@ async fn escrow_approve(
         .and_then(|b| b.try_into().ok())
     {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "requester: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "requester: invalid hex or not 32 bytes" })),
+            )
+        }
     };
 
     let provider_bytes: [u8; 32] = match hex::decode(&req.provider)
@@ -2370,7 +2845,12 @@ async fn escrow_approve(
         .and_then(|b| b.try_into().ok())
     {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "provider: invalid hex or not 32 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "provider: invalid hex or not 32 bytes" })),
+            )
+        }
     };
 
     let conversation_id: [u8; 16] = match hex::decode(&req.conversation_id)
@@ -2378,7 +2858,14 @@ async fn escrow_approve(
         .and_then(|b| b.try_into().ok())
     {
         Some(a) => a,
-        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }))),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "error": "conversation_id: invalid hex or not 16 bytes" }),
+                ),
+            )
+        }
     };
 
     let sk_bytes = state.0.node_signing_key.to_bytes();
@@ -2388,7 +2875,12 @@ async fn escrow_approve(
     let notary_bytes: [u8; 32] = match req.notary {
         Some(ref hex_str) => match hex::decode(hex_str).ok().and_then(|b| b.try_into().ok()) {
             Some(a) => a,
-            None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "notary: invalid hex or not 32 bytes" }))),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "notary: invalid hex or not 32 bytes" })),
+                )
+            }
         },
         None => vk_bytes,
     };
@@ -2417,21 +2909,31 @@ async fn escrow_approve(
                     if fee >= bags.min_fee_micro {
                         let bags = bags.clone();
                         let sk = state.0.node_signing_key.clone();
-                        let rpc = state.0.rpc_url.clone();
+                        let rpc = state.0.trade_rpc_url.clone();
                         let client = state.0.http_client.clone();
-                        let mainnet = state.0.is_mainnet;
+                        let mainnet = state.0.is_trading_mainnet;
                         let state2 = state.clone();
                         tokio::spawn(async move {
-                            match crate::bags::distribute_fee(sk, fee, &bags, &rpc, &client, mainnet).await {
+                            match crate::bags::distribute_fee(
+                                sk, fee, &bags, &rpc, &client, mainnet,
+                            )
+                            .await
+                            {
                                 Ok(txid) => {
-                                    tracing::info!("Bags escrow fee distributed: {txid} ({fee} micro)");
-                                    state2.record_portfolio_event(PortfolioEvent::BagsFee {
-                                        amount_usdc: fee as f64 / 1_000_000.0,
-                                        txid,
-                                        timestamp: now_secs(),
-                                    }).await;
+                                    tracing::info!(
+                                        "Bags escrow fee distributed: {txid} ({fee} micro)"
+                                    );
+                                    state2
+                                        .record_portfolio_event(PortfolioEvent::BagsFee {
+                                            amount_usdc: fee as f64 / 1_000_000.0,
+                                            txid,
+                                            timestamp: now_secs(),
+                                        })
+                                        .await;
                                 }
-                                Err(e) => tracing::warn!("Bags escrow fee distribution failed: {e}"),
+                                Err(e) => {
+                                    tracing::warn!("Bags escrow fee distribution failed: {e}")
+                                }
                             }
                         });
                     }
@@ -2439,7 +2941,10 @@ async fn escrow_approve(
             }
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e.to_string() }))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
     }
 }
 
@@ -2476,8 +2981,8 @@ pub async fn sweep_usdc(
         Pubkey::new_from_array(vk_bytes)
     };
 
-    // 3. Select USDC mint based on network.
-    let usdc_mint_str = if state.0.is_mainnet {
+    // 3. Select USDC mint based on trading network.
+    let usdc_mint_str = if state.0.is_trading_mainnet {
         USDC_MINT_MAINNET
     } else {
         USDC_MINT_DEVNET
@@ -2492,7 +2997,7 @@ pub async fn sweep_usdc(
     let balance_resp = state
         .0
         .http_client
-        .post(&state.0.rpc_url)
+        .post(&state.0.trade_rpc_url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -2525,7 +3030,9 @@ pub async fn sweep_usdc(
             if data.get("error").is_some() {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "token account not found or has no balance" })),
+                    Json(
+                        serde_json::json!({ "error": "token account not found or has no balance" }),
+                    ),
                 )
                     .into_response();
             }
@@ -2572,8 +3079,9 @@ pub async fn sweep_usdc(
     }
 
     // 6. Build SPL Token Transfer instruction (discriminant 3).
-    let spl_token_program: Pubkey =
-        SPL_TOKEN_PROGRAM_ID.parse().expect("valid SPL_TOKEN_PROGRAM_ID");
+    let spl_token_program: Pubkey = SPL_TOKEN_PROGRAM_ID
+        .parse()
+        .expect("valid SPL_TOKEN_PROGRAM_ID");
     let mut ix_data = vec![3u8];
     ix_data.extend_from_slice(&amount_to_sweep.to_le_bytes());
     let transfer_ix = solana_sdk::instruction::Instruction {
@@ -2587,7 +3095,8 @@ pub async fn sweep_usdc(
     };
 
     // 7. Fetch recent blockhash.
-    let blockhash = match fetch_latest_blockhash(&state.0.rpc_url, &state.0.http_client).await {
+    let blockhash = match fetch_latest_blockhash(&state.0.trade_rpc_url, &state.0.http_client).await
+    {
         Ok(bh) => bh,
         Err(e) => {
             return (
@@ -2678,7 +3187,8 @@ pub async fn sweep_usdc(
             }
         };
         let signed_b64 = B64.encode(&serialized);
-        match broadcast_transaction(&state.0.rpc_url, &state.0.http_client, &signed_b64).await {
+        match broadcast_transaction(&state.0.trade_rpc_url, &state.0.http_client, &signed_b64).await
+        {
             Ok(signature) => {
                 let amount_usdc = amount_to_sweep as f64 / 1_000_000.0;
                 tracing::info!("Swept {amount_usdc:.6} USDC → {destination}: tx={signature}");
@@ -2738,10 +3248,7 @@ fn save_exempt_agents(path: &std::path::Path, set: &HashSet<[u8; 32]>) {
 }
 
 /// GET /admin/exempt — list all currently exempt agent IDs.
-async fn admin_exempt_list(
-    headers: HeaderMap,
-    State(state): State<ApiState>,
-) -> Response {
+async fn admin_exempt_list(headers: HeaderMap, State(state): State<ApiState>) -> Response {
     if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
         return resp;
     }
@@ -2875,7 +3382,7 @@ pub async fn portfolio_balances(
     match state
         .0
         .http_client
-        .post(&state.0.rpc_url)
+        .post(&state.0.trade_rpc_url)
         .timeout(std::time::Duration::from_secs(10))
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -2905,7 +3412,7 @@ pub async fn portfolio_balances(
     let spl_res = state
         .0
         .http_client
-        .post(&state.0.rpc_url)
+        .post(&state.0.trade_rpc_url)
         .timeout(std::time::Duration::from_secs(15))
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -2952,16 +3459,12 @@ pub async fn portfolio_balances(
     Ok(Json(PortfolioBalances { tokens }))
 }
 
-
 // ============================================================================
 // Bags fee-sharing config endpoint (feature = "bags")
 // ============================================================================
 
 #[cfg(feature = "bags")]
-async fn bags_config_handler(
-    headers: HeaderMap,
-    State(state): State<ApiState>,
-) -> Response {
+async fn bags_config_handler(headers: HeaderMap, State(state): State<ApiState>) -> Response {
     if let Some(resp) = require_read_or_master_access(&state, &headers) {
         return resp;
     }
@@ -2981,4 +3484,907 @@ async fn bags_config_handler(
         }))
         .into_response(),
     }
+}
+
+// ============================================================================
+// Bags token launch handlers (feature = "bags")
+// ============================================================================
+
+#[cfg(feature = "bags")]
+#[derive(Deserialize)]
+struct BagsLaunchRequest {
+    name: String,
+    symbol: String,
+    description: String,
+    image_url: Option<String>,
+    website_url: Option<String>,
+    twitter_url: Option<String>,
+    telegram_url: Option<String>,
+    /// Lamports to use for the initial token buy (0 = no initial buy).
+    initial_buy_lamports: Option<u64>,
+}
+
+/// POST /bags/launch — launch a new token on Bags.fm with fee-sharing.
+///
+/// Flow:
+///   1. Create token info (IPFS metadata + mint address)
+///   2. Create fee-share config (Kora pays gas if available)
+///   3. Build + sign launch transaction (agent pays SOL for mint account)
+///   4. Broadcast and record portfolio event
+#[cfg(feature = "bags")]
+async fn bags_launch_handler(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Json(req): Json<BagsLaunchRequest>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let launch = match state.0.bags_launch.as_ref() {
+        Some(l) => l.clone(),
+        None => return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Bags API key not configured — set --bags-api-key"})),
+        )
+            .into_response(),
+    };
+
+    let agent_pubkey = Pubkey::new_from_array(state.0.node_signing_key.verifying_key().to_bytes());
+    let agent_wallet = agent_pubkey.to_string();
+
+    // ── Input validation ─────────────────────────────────────────────────────
+    if req.name.is_empty() || req.name.len() > 100 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "name must be 1–100 chars"})),
+        )
+            .into_response();
+    }
+    if req.symbol.is_empty()
+        || req.symbol.len() > 10
+        || !req.symbol.chars().all(|c| c.is_ascii_alphanumeric())
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "symbol must be 1–10 ASCII alphanumeric chars"})),
+        )
+            .into_response();
+    }
+    if req.description.len() > 1000 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "description must be ≤1000 chars"})),
+        )
+            .into_response();
+    }
+    for u in [
+        req.image_url.as_deref(),
+        req.website_url.as_deref(),
+        req.twitter_url.as_deref(),
+        req.telegram_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if u.len() > 512 || (!u.starts_with("https://") && !u.starts_with("http://")) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "URLs must start with http(s):// and be ≤512 chars"})),
+            ).into_response();
+        }
+    }
+
+    // ── Step 1: Create token info ────────────────────────────────────────────
+    let (token_mint, ipfs_uri) = match launch
+        .create_token_info(
+            &req.name,
+            &req.symbol,
+            &req.description,
+            req.image_url.as_deref(),
+            req.website_url.as_deref(),
+            req.twitter_url.as_deref(),
+            req.telegram_url.as_deref(),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("create-token-info: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    // ── Step 2: Create fee-share config (Kora as fee payer when available) ──
+    let fee_payer = if let Some(ref kora) = state.0.kora {
+        match kora.get_fee_payer().await {
+            Ok(pk) => pk.to_string(),
+            Err(e) => {
+                tracing::warn!("Kora fee-payer unavailable, using agent wallet: {e}");
+                agent_wallet.clone()
+            }
+        }
+    } else {
+        agent_wallet.clone()
+    };
+
+    let (config_key, fee_share_txs) = match launch
+        .create_fee_share_config(
+            &fee_payer,
+            &token_mint, // fee-share config is for the launched token, not USDC
+            &[agent_wallet.as_str()],
+            &[10_000u32], // agent receives 100% of pool trading fees
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("fee-share config: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    // Submit fee-share config txs: via Kora (gasless) or direct (agent pays SOL).
+    let use_kora = state.0.kora.is_some() && fee_payer != agent_wallet;
+    let mut fee_share_errors = 0usize;
+    for tx_b64 in &fee_share_txs {
+        let mut submitted = false;
+        if use_kora {
+            if let Some(ref kora) = state.0.kora {
+                match kora.sign_and_send(tx_b64).await {
+                    Ok(_) => submitted = true,
+                    Err(e) => tracing::warn!("Kora fee-share tx failed: {e}"),
+                }
+            }
+        } else {
+            // Agent pays gas: deserialize, sign, broadcast.
+            if let Ok(tx_bytes) = B64.decode(tx_b64) {
+                if let Ok(mut tx) =
+                    bincode::deserialize::<solana_sdk::transaction::Transaction>(&tx_bytes)
+                {
+                    if tx.message.recent_blockhash == solana_sdk::hash::Hash::default() {
+                        tracing::warn!("Fee-share tx has zero blockhash — skipping");
+                    } else {
+                        let kp = to_solana_keypair(&state.0.node_signing_key);
+                        tx.partial_sign(&[&kp], tx.message.recent_blockhash);
+                        if let Ok(serialized) = bincode::serialize(&tx) {
+                            let signed = B64.encode(&serialized);
+                            match broadcast_transaction(
+                                &state.0.trade_rpc_url,
+                                &state.0.http_client,
+                                &signed,
+                            )
+                            .await
+                            {
+                                Ok(_) => submitted = true,
+                                Err(e) => tracing::warn!("Fee-share tx broadcast failed: {e}"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !submitted {
+            fee_share_errors += 1;
+        }
+    }
+    if !fee_share_txs.is_empty() && fee_share_errors == fee_share_txs.len() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": "All fee-share config transactions failed"})),
+        )
+            .into_response();
+    }
+
+    // Allow fee-share config txs to confirm on-chain before creating launch tx.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+    // ── Step 3: Build launch transaction (Bags pre-signs with mint keypair) ──
+    let launch_tx_bytes = match launch
+        .create_launch_transaction(
+            &ipfs_uri,
+            &token_mint,
+            &agent_wallet,
+            req.initial_buy_lamports,
+            &config_key,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("create-launch-tx: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    // ── Step 4: Agent signs + broadcasts ────────────────────────────────────
+    let mut tx =
+        match bincode::deserialize::<solana_sdk::transaction::Transaction>(&launch_tx_bytes) {
+            Ok(t) => t,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("launch-tx deserialize: {e}")})),
+                )
+                    .into_response()
+            }
+        };
+    let kp = to_solana_keypair(&state.0.node_signing_key);
+    tx.partial_sign(&[&kp], tx.message.recent_blockhash);
+    let serialized = match bincode::serialize(&tx) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("launch-tx serialize: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    let txid = match broadcast_transaction(
+        &state.0.trade_rpc_url,
+        &state.0.http_client,
+        &B64.encode(&serialized),
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("launch-tx broadcast: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    // ── Step 5: Record portfolio event ──────────────────────────────────────
+    state
+        .record_portfolio_event(PortfolioEvent::BagsLaunch {
+            token_mint: token_mint.clone(),
+            name: req.name.clone(),
+            symbol: req.symbol.clone(),
+            txid: txid.clone(),
+            timestamp: now_secs(),
+        })
+        .await;
+
+    tracing::info!(
+        "Bags token launched: {} ({}) mint={} txid={}",
+        req.name,
+        req.symbol,
+        token_mint,
+        txid
+    );
+
+    Json(serde_json::json!({
+        "token_mint": token_mint,
+        "txid": txid,
+        "config_key": config_key,
+        "ipfs_uri": ipfs_uri,
+    }))
+    .into_response()
+}
+
+#[cfg(feature = "bags")]
+#[derive(Deserialize)]
+struct BagsClaimRequest {
+    token_mint: String,
+}
+
+/// POST /bags/claim — claim accumulated pool-fee revenue for a launched token.
+#[cfg(feature = "bags")]
+async fn bags_claim_handler(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Json(req): Json<BagsClaimRequest>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    let launch = match state.0.bags_launch.as_ref() {
+        Some(l) => l.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Bags API key not configured"})),
+            )
+                .into_response()
+        }
+    };
+
+    // Validate token_mint is a well-formed base58 pubkey before calling Bags API.
+    if req.token_mint.parse::<Pubkey>().is_err() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "token_mint is not a valid base58 pubkey"})),
+        )
+            .into_response();
+    }
+
+    let agent_pubkey = Pubkey::new_from_array(state.0.node_signing_key.verifying_key().to_bytes());
+    let agent_wallet = agent_pubkey.to_string();
+
+    let claim_txs = match launch
+        .claim_fee_transactions(&agent_wallet, &req.token_mint)
+        .await
+    {
+        Ok(txs) => txs,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("claim-txs: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    let mut txids: Vec<String> = Vec::new();
+    for ctx in &claim_txs {
+        if let Ok(tx_bytes) = B64.decode(&ctx.tx) {
+            if let Ok(mut tx) =
+                bincode::deserialize::<solana_sdk::transaction::Transaction>(&tx_bytes)
+            {
+                if tx.message.recent_blockhash == solana_sdk::hash::Hash::default() {
+                    tracing::warn!("Claim tx has zero blockhash — skipping");
+                    continue;
+                }
+                let kp = to_solana_keypair(&state.0.node_signing_key);
+                tx.partial_sign(&[&kp], tx.message.recent_blockhash);
+                if let Ok(serialized) = bincode::serialize(&tx) {
+                    match broadcast_transaction(
+                        &state.0.trade_rpc_url,
+                        &state.0.http_client,
+                        &B64.encode(&serialized),
+                    )
+                    .await
+                    {
+                        Ok(txid) => {
+                            tracing::info!("Bags fee claimed: {txid}");
+                            txids.push(txid);
+                        }
+                        Err(e) => tracing::warn!("Bags claim broadcast failed: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
+    if !txids.is_empty() {
+        state
+            .record_portfolio_event(PortfolioEvent::BagsClaim {
+                token_mint: req.token_mint.clone(),
+                claimed_txs: txids.len(),
+                timestamp: now_secs(),
+            })
+            .await;
+    }
+
+    Json(serde_json::json!({
+        "claimed_txs": txids.len(),
+        "txids": txids,
+    }))
+    .into_response()
+}
+
+/// GET /bags/positions — list tokens launched by this agent with claimable fees.
+#[cfg(feature = "bags")]
+async fn bags_positions_handler(headers: HeaderMap, State(state): State<ApiState>) -> Response {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
+        return resp;
+    }
+    let launch = match state.0.bags_launch.as_ref() {
+        Some(l) => l.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Bags API key not configured"})),
+            )
+                .into_response()
+        }
+    };
+
+    let agent_pubkey = Pubkey::new_from_array(state.0.node_signing_key.verifying_key().to_bytes());
+    let agent_wallet = agent_pubkey.to_string();
+
+    match launch.launched_tokens(&agent_wallet).await {
+        Ok(positions) => Json(serde_json::json!({"positions": positions})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("positions: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// Agent process management — skill hot-reload
+// ============================================================================
+
+const MAX_AGENT_RELOAD_PER_MINUTE: u32 = 3;
+
+#[derive(Deserialize)]
+struct RegisterPidRequest {
+    pid: u32,
+}
+
+/// Return the real UID of `pid` by reading /proc/{pid}/status.
+/// Returns `None` if the file cannot be read or parsed.
+#[cfg(unix)]
+fn proc_uid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            // Format: "Uid:\t<real>\t<effective>\t<saved>\t<fs>"
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// POST /agent/register-pid — called by NodeService after starting zeroclaw.
+///
+/// Requires auth (same as other mutating endpoints). Validates that the given
+/// PID belongs to a user-space process owned by the same UID as the node to
+/// prevent an attacker from registering arbitrary system PIDs.
+async fn agent_register_pid(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Json(req): Json<RegisterPidRequest>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+
+    // Reject system PIDs and kernel threads — user processes start at 1024+.
+    if req.pid < 1024 || req.pid > 4_194_304 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "pid out of user-space range"})),
+        )
+            .into_response();
+    }
+
+    // Verify the PID belongs to the same UID as the current process.
+    // Prevents an attacker from registering a PID they don't own.
+    #[cfg(unix)]
+    {
+        let our_uid = unsafe { libc::getuid() };
+        match proc_uid(req.pid) {
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "process not found or not readable"})),
+                )
+                    .into_response()
+            }
+            Some(pid_uid) if pid_uid != our_uid => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "pid belongs to a different user"})),
+                )
+                    .into_response()
+            }
+            _ => {}
+        }
+    }
+
+    *state.0.agent_pid.lock().await = Some(req.pid);
+    tracing::info!("Agent PID registered: {}", req.pid);
+    Json(serde_json::json!({"ok": true})).into_response()
+}
+
+/// POST /agent/reload — signal zeroclaw to restart so it picks up new skills.
+///
+/// Sends SIGTERM to the registered zeroclaw PID. NodeService's restart loop
+/// automatically re-launches zeroclaw, which re-reads all SKILL.toml files.
+/// Rate-limited to 3 reloads per minute to prevent DoS via reload loop.
+async fn agent_reload(headers: HeaderMap, State(state): State<ApiState>) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+
+    // Rate limit: max 3 reloads per minute.
+    {
+        let mut rl = state.0.agent_reload_rate_limit.lock().await;
+        let now = now_secs();
+        if now.saturating_sub(rl.window_start) >= 60 {
+            rl.window_start = now;
+            rl.count = 0;
+        }
+        if rl.count >= MAX_AGENT_RELOAD_PER_MINUTE {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "reload rate limit exceeded (max 3/min)"})),
+            )
+                .into_response();
+        }
+        rl.count += 1;
+    }
+
+    let pid = *state.0.agent_pid.lock().await;
+    match pid {
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "No agent PID registered — is zeroclaw running?"})),
+        )
+            .into_response(),
+        Some(pid) => {
+            // SIGTERM — zeroclaw exits gracefully, NodeService auto-restarts it.
+            let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            if result == 0 {
+                tracing::info!("Sent SIGTERM to agent PID {pid} for skill reload");
+                Json(serde_json::json!({"ok": true, "pid": pid})).into_response()
+            } else {
+                let err = std::io::Error::last_os_error();
+                tracing::warn!("Failed to send SIGTERM to agent PID {pid}: {err}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("kill({pid}): {err}")})),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Skill manager REST endpoints — safe Rust-side file operations
+// ============================================================================
+
+/// Validate a skill name: lowercase alphanumeric + hyphens + underscores,
+/// no path separators, no leading hyphens, 1–64 chars.
+fn validate_skill_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("skill name must be 1–64 chars");
+    }
+    if name.starts_with('-') || name.starts_with('_') {
+        return Err("skill name must start with a letter or digit");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err("skill name may only contain lowercase letters, digits, hyphens, underscores");
+    }
+    Ok(())
+}
+
+/// Check that `path` is strictly inside `base` (no path traversal).
+fn is_inside(path: &std::path::Path, base: &std::path::Path) -> bool {
+    // Both paths must be canonicalized by the caller.
+    path.starts_with(base)
+}
+
+macro_rules! skill_workspace {
+    ($state:expr) => {
+        match $state.0.skill_workspace.as_ref() {
+            Some(w) => w,
+            None => return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "skill workspace not configured (--skill-workspace)"})),
+            ).into_response(),
+        }
+    };
+}
+
+/// GET /skill/list — list installed skill names.
+async fn skill_list_handler(headers: HeaderMap, State(state): State<ApiState>) -> Response {
+    if let Some(resp) = require_read_or_master_access(&state, &headers) {
+        return resp;
+    }
+    let workspace = skill_workspace!(state);
+    let skills_dir = workspace.join("skills");
+    let mut skills: Vec<String> = Vec::new();
+    match tokio::fs::read_dir(&skills_dir).await {
+        Ok(mut dir) => {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                if let Ok(ft) = entry.file_type().await {
+                    if ft.is_dir() {
+                        skills.push(entry.file_name().to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        Err(_) => { /* directory doesn't exist yet — empty list */ }
+    }
+    skills.sort();
+    Json(serde_json::json!({"skills": skills})).into_response()
+}
+
+#[derive(Deserialize)]
+struct SkillWriteRequest {
+    name: String,
+    /// Base64-encoded SKILL.toml content.
+    content_b64: String,
+}
+
+/// POST /skill/write — install a new skill by writing its SKILL.toml.
+///
+/// `content_b64` must be the base64-encoded UTF-8 SKILL.toml. The name is
+/// validated before any filesystem operation — no path traversal possible.
+async fn skill_write_handler(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Json(req): Json<SkillWriteRequest>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    if let Err(e) = validate_skill_name(&req.name) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+    let workspace = skill_workspace!(state);
+
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    let content_bytes = match B64.decode(&req.content_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "content_b64 is not valid base64"})),
+            )
+                .into_response()
+        }
+    };
+    if content_bytes.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "decoded content is empty"})),
+        )
+            .into_response();
+    }
+    let content_str = match String::from_utf8(content_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "content is not valid UTF-8"})),
+            )
+                .into_response()
+        }
+    };
+
+    let skill_dir = workspace.join("skills").join(&req.name);
+    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("mkdir: {e}")})),
+        )
+            .into_response();
+    }
+    let toml_path = skill_dir.join("SKILL.toml");
+    if let Err(e) = tokio::fs::write(&toml_path, &content_str).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("write: {e}")})),
+        )
+            .into_response();
+    }
+    tracing::info!("Skill '{}' written ({} bytes)", req.name, content_str.len());
+    Json(serde_json::json!({"ok": true, "name": req.name})).into_response()
+}
+
+#[derive(Deserialize)]
+struct SkillInstallUrlRequest {
+    name: String,
+    url: String,
+}
+
+/// Reject private/loopback IP ranges used in SSRF attacks.
+fn is_private_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+    }
+    false
+}
+
+/// POST /skill/install-url — fetch a SKILL.toml from an HTTPS URL and install it.
+///
+/// Only HTTPS is accepted. Private/loopback hosts are rejected to prevent SSRF.
+/// The content size is capped at 128 KiB.
+async fn skill_install_url_handler(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Json(req): Json<SkillInstallUrlRequest>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    if let Err(e) = validate_skill_name(&req.name) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+
+    // Parse and validate URL.
+    let parsed = match req.url.parse::<url::Url>() {
+        Ok(u) => u,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "invalid URL"})),
+            )
+                .into_response()
+        }
+    };
+    if parsed.scheme() != "https" {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "only HTTPS URLs are accepted"})),
+        )
+            .into_response();
+    }
+    if let Some(host) = parsed.host_str() {
+        if is_private_host(host) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "private/loopback hosts are not allowed"})),
+            )
+                .into_response();
+        }
+    }
+
+    let workspace = skill_workspace!(state);
+
+    // Fetch content via the shared HTTP client (safe, no shell involved).
+    let resp = match state
+        .0
+        .http_client
+        .get(parsed)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("fetch failed: {e}")})),
+            )
+                .into_response()
+        }
+    };
+    if !resp.status().is_success() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("remote returned {}", resp.status())})),
+        )
+            .into_response();
+    }
+
+    const MAX_SKILL_BYTES: usize = 128 * 1024; // 128 KiB
+    let content = match resp.text().await {
+        Ok(t) if t.len() <= MAX_SKILL_BYTES => t,
+        Ok(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": "SKILL.toml exceeds 128 KiB limit"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("read body: {e}")})),
+            )
+                .into_response()
+        }
+    };
+
+    let skill_dir = workspace.join("skills").join(&req.name);
+    if let Err(e) = tokio::fs::create_dir_all(&skill_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("mkdir: {e}")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = tokio::fs::write(skill_dir.join("SKILL.toml"), &content).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("write: {e}")})),
+        )
+            .into_response();
+    }
+    tracing::info!(
+        "Skill '{}' installed from URL ({} bytes)",
+        req.name,
+        content.len()
+    );
+    Json(serde_json::json!({"ok": true, "name": req.name, "bytes": content.len()})).into_response()
+}
+
+#[derive(Deserialize)]
+struct SkillRemoveRequest {
+    name: String,
+}
+
+/// POST /skill/remove — remove an installed skill by name.
+///
+/// The skill name is validated (no path traversal). The resulting path is
+/// verified to be inside the skills directory before deletion.
+async fn skill_remove_handler(
+    headers: HeaderMap,
+    State(state): State<ApiState>,
+    Json(req): Json<SkillRemoveRequest>,
+) -> Response {
+    if let Some(resp) = require_api_secret_or_unauthorized(&state, &headers) {
+        return resp;
+    }
+    if let Err(e) = validate_skill_name(&req.name) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+    let workspace = skill_workspace!(state);
+    let skills_root = workspace.join("skills");
+    let skill_dir = skills_root.join(&req.name);
+
+    // Canonicalize both paths and verify containment — belt-and-suspenders against symlinks.
+    let canonical_root = match skills_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "skills directory does not exist"})),
+            )
+                .into_response()
+        }
+    };
+    let canonical_skill = match skill_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("skill '{}' not found", req.name)})),
+            )
+                .into_response()
+        }
+    };
+    if !is_inside(&canonical_skill, &canonical_root) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "path traversal detected"})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = tokio::fs::remove_dir_all(&skill_dir).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("remove: {e}")})),
+        )
+            .into_response();
+    }
+    tracing::info!("Skill '{}' removed", req.name);
+    Json(serde_json::json!({"ok": true, "name": req.name})).into_response()
 }

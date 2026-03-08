@@ -363,14 +363,12 @@ fn compute_geo_consistent(
         | "IR" | "IL" | "JO" | "LB" | "SY" | "TR" => (260, 180),
         // Sub-Saharan Africa
         "NG" | "GH" | "KE" | "ZA" | "ET" | "TZ" | "UG" | "RW" | "SN" | "CI" | "CM" | "CD"
-        | "AO" | "MZ" | "ZM" | "ZW" | "BW" | "NA" | "MG" | "MU" | "TG" | "BJ" | "ML"
-        | "BF" | "NE" | "TD" | "SO" | "ER" | "SS" => (300, 220),
+        | "AO" | "MZ" | "ZM" | "ZW" | "BW" | "NA" | "MG" | "MU" | "TG" | "BJ" | "ML" | "BF"
+        | "NE" | "TD" | "SO" | "ER" | "SS" => (300, 220),
         // South Asia
         "IN" | "PK" | "BD" | "LK" | "NP" | "AF" | "MV" => (360, 300),
         // Southeast Asia
-        "SG" | "MY" | "TH" | "PH" | "ID" | "VN" | "MM" | "KH" | "LA" | "BN" | "TL" => {
-            (380, 340)
-        }
+        "SG" | "MY" | "TH" | "PH" | "ID" | "VN" | "MM" | "KH" | "LA" | "BN" | "TL" => (380, 340),
         // East Asia
         "JP" | "KR" | "CN" | "TW" | "HK" | "MO" | "MN" => (340, 360),
         // Central Asia
@@ -435,8 +433,8 @@ impl AgentReputation {
             1 => self.neutral_count += 1,
             _ => self.positive_count += 1,
         }
-        self.average_score = (self.total_score as f64 / self.feedback_count as f64)
-            .clamp(-100.0, 100.0);
+        self.average_score =
+            (self.total_score as f64 / self.feedback_count as f64).clamp(-100.0, 100.0);
         self.last_updated = now_secs();
     }
 
@@ -1083,10 +1081,8 @@ impl Db {
                 row.get::<_, i64>(2)? as u64,
             ))
         })?;
-        let mut map: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, u64>,
-        > = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, std::collections::HashMap<String, u64>> =
+            std::collections::HashMap::new();
         for row in rows {
             let (agent_id, region, rtt_ms) = row?;
             map.entry(agent_id).or_default().insert(region, rtt_ms);
@@ -2254,17 +2250,11 @@ impl ReputationStore {
                     return None;
                 }
                 if !is_valid_agent_id(&fb.sender) {
-                    tracing::warn!(
-                        "Ingest: invalid sender '{}' — dropped",
-                        &fb.sender
-                    );
+                    tracing::warn!("Ingest: invalid sender '{}' — dropped", &fb.sender);
                     return None;
                 }
                 if fb.sender == fb.target_agent {
-                    tracing::warn!(
-                        "Ingest: self-feedback from '{}' — dropped",
-                        &fb.sender
-                    );
+                    tracing::warn!("Ingest: self-feedback from '{}' — dropped", &fb.sender);
                     return None;
                 }
                 // DB dedup check: if (sender, conversation_id) already exists in SQLite,
@@ -2493,10 +2483,7 @@ impl ReputationStore {
                                 !s.is_empty()
                                     && s.len() <= 64
                                     && s.chars().all(|ch| {
-                                        ch.is_alphanumeric()
-                                            || ch == ' '
-                                            || ch == '-'
-                                            || ch == '\''
+                                        ch.is_alphanumeric() || ch == ' ' || ch == '-' || ch == '\''
                                     })
                             })
                             .map(str::to_string);

@@ -41,12 +41,30 @@ pub const TOKEN_2022_PROGRAM_ID_STR: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqC
 pub const SPL_TOKEN_PROGRAM_ID_STR: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const ASSOCIATED_TOKEN_PROGRAM_ID_STR: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bJo";
 
-pub fn behavior_log_program_id() -> Pubkey { Pubkey::from_str(BEHAVIOR_LOG_PROGRAM_ID_STR).unwrap() }
-pub fn lease_program_id() -> Pubkey { Pubkey::from_str(LEASE_PROGRAM_ID_STR).unwrap() }
-pub fn challenge_program_id() -> Pubkey { Pubkey::from_str(CHALLENGE_PROGRAM_ID_STR).unwrap() }
-pub fn stake_lock_program_id() -> Pubkey { Pubkey::from_str(STAKE_LOCK_PROGRAM_ID_STR).unwrap() }
-pub fn escrow_program_id() -> Pubkey { Pubkey::from_str(ESCROW_PROGRAM_ID_STR).unwrap() }
-pub fn agent_ownership_program_id() -> Pubkey { Pubkey::from_str(AGENT_OWNERSHIP_PROGRAM_ID_STR).unwrap() }
-pub fn token_2022_program_id() -> Pubkey { Pubkey::from_str(TOKEN_2022_PROGRAM_ID_STR).unwrap() }
-pub fn spl_token_program_id() -> Pubkey { Pubkey::from_str(SPL_TOKEN_PROGRAM_ID_STR).unwrap() }
-pub fn associated_token_program_id() -> Pubkey { Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID_STR).unwrap() }
+pub fn behavior_log_program_id() -> Pubkey {
+    Pubkey::from_str(BEHAVIOR_LOG_PROGRAM_ID_STR).unwrap()
+}
+pub fn lease_program_id() -> Pubkey {
+    Pubkey::from_str(LEASE_PROGRAM_ID_STR).unwrap()
+}
+pub fn challenge_program_id() -> Pubkey {
+    Pubkey::from_str(CHALLENGE_PROGRAM_ID_STR).unwrap()
+}
+pub fn stake_lock_program_id() -> Pubkey {
+    Pubkey::from_str(STAKE_LOCK_PROGRAM_ID_STR).unwrap()
+}
+pub fn escrow_program_id() -> Pubkey {
+    Pubkey::from_str(ESCROW_PROGRAM_ID_STR).unwrap()
+}
+pub fn agent_ownership_program_id() -> Pubkey {
+    Pubkey::from_str(AGENT_OWNERSHIP_PROGRAM_ID_STR).unwrap()
+}
+pub fn token_2022_program_id() -> Pubkey {
+    Pubkey::from_str(TOKEN_2022_PROGRAM_ID_STR).unwrap()
+}
+pub fn spl_token_program_id() -> Pubkey {
+    Pubkey::from_str(SPL_TOKEN_PROGRAM_ID_STR).unwrap()
+}
+pub fn associated_token_program_id() -> Pubkey {
+    Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID_STR).unwrap()
+}

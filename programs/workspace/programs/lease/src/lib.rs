@@ -95,7 +95,7 @@ pub mod lease {
 
         lease.version = 1;
         lease.agent_id = args.agent_id;
-        
+
         // 8004 agents use their own pubkey bytes as their agent_id.
         require!(
             args.agent_id == ctx.accounts.owner.key().to_bytes(),

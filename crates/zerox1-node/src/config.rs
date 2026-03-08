@@ -224,6 +224,32 @@ pub struct Config {
     #[cfg(feature = "bags")]
     #[arg(long, env = "ZX01_BAGS_API_URL", default_value = "https://api.bags.fm")]
     pub bags_api_url: String,
+
+    /// Bags.fm API key for the token-launch endpoints.
+    /// Required to use POST /bags/launch, POST /bags/claim, GET /bags/positions.
+    /// Obtain from bags.fm — free tier allows 1 000 requests/hr.
+    #[cfg(feature = "bags")]
+    #[arg(long, env = "ZX01_BAGS_API_KEY")]
+    pub bags_api_key: Option<String>,
+
+    /// Solana RPC endpoint for trading operations (Jupiter swaps, Bags fee distribution,
+    /// USDC hot-wallet sweep).  Defaults to mainnet so financial operations are always
+    /// on the real network regardless of the mesh --rpc-url (which defaults to devnet).
+    ///
+    /// Override with ZX01_TRADE_RPC_URL to use a paid RPC (Helius, QuickNode, etc.).
+    #[arg(
+        long,
+        env = "ZX01_TRADE_RPC_URL",
+        default_value = "https://api.mainnet-beta.solana.com"
+    )]
+    pub trade_rpc_url: String,
+
+    /// Zeroclaw workspace directory. When set, enables POST /skill/write,
+    /// POST /skill/install-url, POST /skill/remove, GET /skill/list — the
+    /// skill management REST API used by the skill-manager built-in skill.
+    /// On Android this is set to {filesDir}/zw by NodeService.
+    #[arg(long, env = "ZX01_SKILL_WORKSPACE")]
+    pub skill_workspace: Option<PathBuf>,
 }
 
 impl Config {

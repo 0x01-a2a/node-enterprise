@@ -24,6 +24,10 @@ const BATCH_SUBMITTED_SLOT_OFFSET: usize = 113;
 /// Byte offset of `log_merkle_root` in BatchAccount raw data.
 /// Layout: 8 disc + 1 version + 32 agent_id + 8 epoch_number = 49
 const BATCH_MERKLE_ROOT_OFFSET: usize = 49;
+/// Byte offset of `agent_id` in BatchAccount raw data.
+const BATCH_AGENT_ID_OFFSET: usize = 9;
+/// Byte offset of `epoch_number` in BatchAccount raw data.
+const BATCH_EPOCH_NUMBER_OFFSET: usize = 41;
 
 // ============================================================================
 // Challenge Program (doc 5, §10.4)
@@ -64,29 +68,14 @@ pub mod challenge {
         args: SubmitChallengeArgs,
     ) -> Result<()> {
         let clock = Clock::get()?;
-
-        // Verify batch account is owned by the behavior-log program.
+        let batch = parse_batch_account(&ctx.accounts.batch_account)?;
         require!(
-            ctx.accounts.batch_account.owner == &BEHAVIOR_LOG_PROGRAM_ID,
-            ChallengeError::InvalidBatchAccount,
+            batch.agent_id == args.agent_id && batch.epoch_number == args.epoch_number,
+            ChallengeError::BatchMetadataMismatch,
         );
 
-        // Read submitted_slot from BatchAccount raw bytes (offset 112).
-        let batch_submitted_slot = {
-            let data = ctx.accounts.batch_account.try_borrow_data()?;
-            require!(
-                data.len() > BATCH_SUBMITTED_SLOT_OFFSET + 8,
-                ChallengeError::InvalidBatchAccount,
-            );
-            u64::from_le_bytes(
-                data[BATCH_SUBMITTED_SLOT_OFFSET..BATCH_SUBMITTED_SLOT_OFFSET + 8]
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-
         require!(
-            clock.slot <= batch_submitted_slot + CHALLENGE_WINDOW_SLOTS,
+            clock.slot <= batch.submitted_slot + CHALLENGE_WINDOW_SLOTS,
             ChallengeError::ChallengeWindowExpired,
         );
         require!(
@@ -223,30 +212,31 @@ pub mod challenge {
             ChallengeError::EntryHashMismatch,
         );
 
+        let batch = parse_batch_account(&ctx.accounts.batch_account)?;
         require!(
-            ctx.accounts.batch_account.owner == &BEHAVIOR_LOG_PROGRAM_ID,
-            ChallengeError::InvalidBatchAccount,
+            batch.agent_id == ctx.accounts.challenge_account.agent_id
+                && batch.epoch_number == ctx.accounts.challenge_account.epoch_number,
+            ChallengeError::BatchMetadataMismatch,
         );
-
-        // Read log_merkle_root from BatchAccount raw bytes at offset 48.
-        // Layout: 8 disc + 32 agent_id + 8 epoch_number = 48.
-        let log_merkle_root: [u8; 32] = {
-            let data = ctx.accounts.batch_account.try_borrow_data()?;
-            require!(
-                data.len() >= BATCH_MERKLE_ROOT_OFFSET + 32,
-                ChallengeError::InvalidBatchAccount,
-            );
-            data[BATCH_MERKLE_ROOT_OFFSET..BATCH_MERKLE_ROOT_OFFSET + 32]
-                .try_into()
-                .unwrap()
-        };
+        require!(
+            ctx.accounts.stake_account.agent_mint == ctx.accounts.challenge_account.agent_id,
+            ChallengeError::InvalidStakeAccount,
+        );
+        validate_stake_binding(
+            &ctx.accounts.challenge_account.agent_id,
+            &ctx.accounts.stake_account.agent_mint,
+            &ctx.accounts.stake_program.key(),
+            &ctx.accounts.stake_vault_authority.key(),
+            &ctx.accounts.stake_vault.key(),
+            &ctx.accounts.usdc_mint.key(),
+        )?;
 
         // Verify Merkle inclusion proof on-chain.
         let proof_valid = verify_inclusion(
             &args.contradicting_entry,
             &args.merkle_proof,
             ctx.accounts.challenge_account.leaf_index,
-            log_merkle_root,
+            batch.log_merkle_root,
         );
         require!(proof_valid, ChallengeError::InvalidMerkleProof);
 
@@ -626,4 +616,140 @@ pub enum ChallengeError {
     InvalidMerkleProof,
     #[msg("Contradicting entry does not match the hash recorded at submission")]
     EntryHashMismatch,
+    #[msg("Batch account metadata does not match the challenged agent or epoch")]
+    BatchMetadataMismatch,
+    #[msg("Stake account inputs do not match the challenged agent")]
+    InvalidStakeAccount,
+}
+
+struct ParsedBatchAccount {
+    pub agent_id: [u8; 32],
+    pub epoch_number: u64,
+    pub log_merkle_root: [u8; 32],
+    pub submitted_slot: u64,
+}
+
+fn parse_batch_account(batch_account: &UncheckedAccount<'_>) -> Result<ParsedBatchAccount> {
+    require!(
+        batch_account.owner == &BEHAVIOR_LOG_PROGRAM_ID,
+        ChallengeError::InvalidBatchAccount,
+    );
+
+    let data = batch_account.try_borrow_data()?;
+    require!(
+        data.len() >= BATCH_SUBMITTED_SLOT_OFFSET + 8,
+        ChallengeError::InvalidBatchAccount,
+    );
+
+    let mut agent_id = [0u8; 32];
+    agent_id.copy_from_slice(&data[BATCH_AGENT_ID_OFFSET..BATCH_AGENT_ID_OFFSET + 32]);
+
+    let epoch_number = u64::from_le_bytes(
+        data[BATCH_EPOCH_NUMBER_OFFSET..BATCH_EPOCH_NUMBER_OFFSET + 8]
+            .try_into()
+            .map_err(|_| error!(ChallengeError::InvalidBatchAccount))?,
+    );
+
+    let mut log_merkle_root = [0u8; 32];
+    log_merkle_root.copy_from_slice(&data[BATCH_MERKLE_ROOT_OFFSET..BATCH_MERKLE_ROOT_OFFSET + 32]);
+
+    let submitted_slot = u64::from_le_bytes(
+        data[BATCH_SUBMITTED_SLOT_OFFSET..BATCH_SUBMITTED_SLOT_OFFSET + 8]
+            .try_into()
+            .map_err(|_| error!(ChallengeError::InvalidBatchAccount))?,
+    );
+
+    let (expected_batch, _) = Pubkey::find_program_address(
+        &[b"batch", agent_id.as_ref(), &epoch_number.to_le_bytes()],
+        &BEHAVIOR_LOG_PROGRAM_ID,
+    );
+    require!(
+        batch_account.key() == expected_batch,
+        ChallengeError::InvalidBatchAccount,
+    );
+
+    Ok(ParsedBatchAccount {
+        agent_id,
+        epoch_number,
+        log_merkle_root,
+        submitted_slot,
+    })
+}
+
+fn validate_stake_binding(
+    challenge_agent_id: &[u8; 32],
+    stake_agent_mint: &[u8; 32],
+    stake_program_id: &Pubkey,
+    stake_vault_authority: &Pubkey,
+    stake_vault: &Pubkey,
+    usdc_mint: &Pubkey,
+) -> Result<()> {
+    require!(
+        stake_agent_mint == challenge_agent_id,
+        ChallengeError::InvalidStakeAccount,
+    );
+
+    let (expected_stake_vault_authority, _) = Pubkey::find_program_address(
+        &[b"stake_vault", stake_agent_mint.as_ref()],
+        stake_program_id,
+    );
+    require!(
+        *stake_vault_authority == expected_stake_vault_authority,
+        ChallengeError::InvalidStakeAccount,
+    );
+
+    let expected_stake_vault = anchor_spl::associated_token::get_associated_token_address(
+        &expected_stake_vault_authority,
+        usdc_mint,
+    );
+    require!(
+        *stake_vault == expected_stake_vault,
+        ChallengeError::InvalidStakeAccount,
+    );
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_inclusion_rejects_wrong_leaf_index() {
+        let entry = b"entry";
+        let sibling = [7u8; 32];
+
+        let mut leaf_input = Vec::from([0x00]);
+        leaf_input.extend_from_slice(entry);
+        let leaf = anchor_lang::solana_program::keccak::hash(&leaf_input).to_bytes();
+
+        let mut combined = [0u8; 65];
+        combined[0] = 0x01;
+        combined[1..33].copy_from_slice(&leaf);
+        combined[33..65].copy_from_slice(&sibling);
+        let root = anchor_lang::solana_program::keccak::hash(&combined).to_bytes();
+
+        assert!(verify_inclusion(entry, &[sibling], 0, root));
+        assert!(!verify_inclusion(entry, &[sibling], 1, root));
+    }
+
+    #[test]
+    fn validate_stake_binding_rejects_mismatched_agent() {
+        let challenge_agent_id = [1u8; 32];
+        let stake_agent_mint = [2u8; 32];
+        let stake_program_id = crate::ID;
+        let stake_vault_authority = Pubkey::new_unique();
+        let stake_vault = Pubkey::new_unique();
+        let usdc_mint = Pubkey::new_unique();
+
+        assert!(validate_stake_binding(
+            &challenge_agent_id,
+            &stake_agent_mint,
+            &stake_program_id,
+            &stake_vault_authority,
+            &stake_vault,
+            &usdc_mint,
+        )
+        .is_err());
+    }
 }

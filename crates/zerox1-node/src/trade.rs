@@ -7,11 +7,14 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 
-use solana_sdk::transaction::VersionedTransaction;
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use ed25519_dalek::Signer;
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::transaction::VersionedTransaction;
 
-use crate::api::{require_api_secret_or_unauthorized, resolve_hosted_token, ApiState, PortfolioEvent};
+use crate::api::{
+    require_api_secret_or_unauthorized, resolve_active_hosted_signing_key, resolve_hosted_token,
+    ApiState, PortfolioEvent,
+};
 
 #[derive(Deserialize)]
 pub struct SwapRequest {
@@ -90,9 +93,11 @@ fn is_whitelisted(mint: &str) -> bool {
 /// (32-44 characters, base58 alphabet only).
 fn is_valid_pubkey(s: &str) -> bool {
     matches!(s.len(), 32..=44)
-        && s.chars().all(|c| matches!(c,
-            '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z'
-        ))
+        && s.chars().all(|c| {
+            matches!(c,
+                '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z'
+            )
+        })
 }
 
 /// Known token mint decimal precision. Returns `None` for unrecognised mints.
@@ -123,9 +128,8 @@ pub async fn trade_swap_handler(
     Json(req): Json<SwapRequest>,
 ) -> Response {
     let signing_key = if let Some(token) = resolve_hosted_token(&headers) {
-        let sessions = state.inner().hosted_sessions.read().await;
-        if let Some(session) = sessions.get(&token) {
-            session.signing_key.clone()
+        if let Some(signing_key) = resolve_active_hosted_signing_key(&state, &token).await {
+            signing_key
         } else {
             return err_resp(StatusCode::UNAUTHORIZED, "invalid or expired token".into());
         }
@@ -145,10 +149,19 @@ pub async fn trade_swap_handler(
         return err_resp(StatusCode::BAD_REQUEST, "mints must differ".into());
     }
     if !is_whitelisted(&req.input_mint) {
-        return err_resp(StatusCode::BAD_REQUEST, format!("input_mint {} is not in the swap whitelist", req.input_mint));
+        return err_resp(
+            StatusCode::BAD_REQUEST,
+            format!("input_mint {} is not in the swap whitelist", req.input_mint),
+        );
     }
     if !is_whitelisted(&req.output_mint) {
-        return err_resp(StatusCode::BAD_REQUEST, format!("output_mint {} is not in the swap whitelist", req.output_mint));
+        return err_resp(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "output_mint {} is not in the swap whitelist",
+                req.output_mint
+            ),
+        );
     }
     if req.amount == 0 {
         return err_resp(StatusCode::BAD_REQUEST, "amount must be > 0".into());
@@ -156,13 +169,22 @@ pub async fn trade_swap_handler(
 
     let slippage = req.slippage_bps.unwrap_or(50);
     if slippage > 1_000 {
-        return err_resp(StatusCode::BAD_REQUEST, "slippage_bps cannot exceed 1000 (10%)".into());
+        return err_resp(
+            StatusCode::BAD_REQUEST,
+            "slippage_bps cannot exceed 1000 (10%)".into(),
+        );
     }
 
     let input_decimals = mint_decimals(&req.input_mint).unwrap_or(6);
     let output_decimals = mint_decimals(&req.output_mint).unwrap_or(6);
 
-    tracing::info!("Swap: {} - {} to {} amount {}", signer, req.input_mint, req.output_mint, req.amount);
+    tracing::info!(
+        "Swap: {} - {} to {} amount {}",
+        signer,
+        req.input_mint,
+        req.output_mint,
+        req.amount
+    );
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -181,15 +203,26 @@ pub async fn trade_swap_handler(
     };
 
     if !quote_res.status().is_success() {
-        return err_resp(StatusCode::BAD_GATEWAY, "Jupiter Quote returned error".into());
+        return err_resp(
+            StatusCode::BAD_GATEWAY,
+            "Jupiter Quote returned error".into(),
+        );
     }
 
     let quote_json: serde_json::Value = match quote_res.json().await {
         Ok(j) => j,
-        Err(e) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse quote: {e}")),
+        Err(e) => {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse quote: {e}"),
+            )
+        }
     };
 
-    let out_amount_str = quote_json.get("outAmount").and_then(|v| v.as_str()).unwrap_or("0");
+    let out_amount_str = quote_json
+        .get("outAmount")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0");
     let out_amount: u64 = out_amount_str.parse().unwrap_or(0);
 
     let kora_fee_payer_opt = if let Some(ref kora) = state.inner().kora {
@@ -209,21 +242,36 @@ pub async fn trade_swap_handler(
         quote_response: quote_json,
         dynamic_compute_unit_limit: true,
         prioritization_fee_lamports: "auto".to_string(),
-        fee_account: kora_fee_payer_opt.as_ref().map(|p: &solana_sdk::pubkey::Pubkey| p.to_string()),
+        fee_account: kora_fee_payer_opt
+            .as_ref()
+            .map(|p: &solana_sdk::pubkey::Pubkey| p.to_string()),
     };
 
-    let swap_res = match client.post("https://quote-api.jup.ag/v6/swap").json(&swap_req).send().await {
+    let swap_res = match client
+        .post("https://quote-api.jup.ag/v6/swap")
+        .json(&swap_req)
+        .send()
+        .await
+    {
         Ok(res) => res,
         Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("Swap req fail: {e}")),
     };
 
     if !swap_res.status().is_success() {
-        return err_resp(StatusCode::BAD_GATEWAY, "Jupiter Swap returned error".into());
+        return err_resp(
+            StatusCode::BAD_GATEWAY,
+            "Jupiter Swap returned error".into(),
+        );
     }
 
     let swap_data: JupiterSwapResponse = match swap_res.json().await {
         Ok(d) => d,
-        Err(_) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "Invalid JSON from Jupiter".into()),
+        Err(_) => {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid JSON from Jupiter".into(),
+            )
+        }
     };
 
     let tx_bytes = B64.decode(&swap_data.swap_transaction).unwrap_or_default();
@@ -234,11 +282,18 @@ pub async fn trade_swap_handler(
 
     if kora_fee_payer_opt.is_none() {
         let fee_payer_ok = match &versioned_tx.message {
-            solana_sdk::message::VersionedMessage::Legacy(msg) => msg.account_keys.first() == Some(&signer),
-            solana_sdk::message::VersionedMessage::V0(msg) => msg.account_keys.first() == Some(&signer),
+            solana_sdk::message::VersionedMessage::Legacy(msg) => {
+                msg.account_keys.first() == Some(&signer)
+            }
+            solana_sdk::message::VersionedMessage::V0(msg) => {
+                msg.account_keys.first() == Some(&signer)
+            }
         };
         if !fee_payer_ok {
-            return err_resp(StatusCode::BAD_GATEWAY, "Jupiter returned unexpected fee payer".into());
+            return err_resp(
+                StatusCode::BAD_GATEWAY,
+                "Jupiter returned unexpected fee payer".into(),
+            );
         }
     }
 
@@ -246,25 +301,33 @@ pub async fn trade_swap_handler(
     let sig = signing_key.sign(&msg_bytes);
 
     let txid = if let Some(ref kora) = state.inner().kora {
-        let signer_index = versioned_tx.message.static_account_keys().iter().position(|&k| k == signer);
+        let signer_index = versioned_tx
+            .message
+            .static_account_keys()
+            .iter()
+            .position(|&k| k == signer);
         if let Some(idx) = signer_index {
             if idx < versioned_tx.signatures.len() {
-                versioned_tx.signatures[idx] = solana_sdk::signature::Signature::from(sig.to_bytes());
+                versioned_tx.signatures[idx] =
+                    solana_sdk::signature::Signature::from(sig.to_bytes());
             } else {
-                return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "Signer missing from signatures".into());
+                return err_resp(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Signer missing from signatures".into(),
+                );
             }
         }
-        
+
         let tx_b64 = B64.encode(bincode::serialize(&versioned_tx).unwrap());
         match kora.sign_and_send(&tx_b64).await {
-            Ok(s) => s, 
+            Ok(s) => s,
             Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("Kora send failed: {e}")),
         }
     } else {
         if !versioned_tx.signatures.is_empty() {
             versioned_tx.signatures[0] = solana_sdk::signature::Signature::from(sig.to_bytes());
         }
-        let rpc_client = RpcClient::new(state.inner().rpc_url.clone());
+        let rpc_client = RpcClient::new(state.inner().trade_rpc_url.clone());
         match rpc_client.send_and_confirm_transaction(&versioned_tx).await {
             Ok(s) => s.to_string(),
             Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("Broadcast failed: {e}")),
@@ -283,22 +346,25 @@ pub async fn trade_swap_handler(
             if fee >= bags.min_fee_micro {
                 let bags = bags.clone();
                 let sk = state.inner().node_signing_key.clone();
-                let rpc = state.inner().rpc_url.clone();
+                let rpc = state.inner().trade_rpc_url.clone();
                 let client = state.inner().http_client.clone();
-                let mainnet = state.inner().is_mainnet;
+                let mainnet = state.inner().is_trading_mainnet;
                 let state2 = state.clone();
                 tokio::spawn(async move {
-                    match crate::bags::distribute_fee(sk, fee, &bags, &rpc, &client, mainnet).await {
+                    match crate::bags::distribute_fee(sk, fee, &bags, &rpc, &client, mainnet).await
+                    {
                         Ok(txid) => {
                             tracing::info!("Bags swap fee distributed: {txid} ({fee} micro)");
-                            state2.record_portfolio_event(PortfolioEvent::BagsFee {
-                                amount_usdc: fee as f64 / 1_000_000.0,
-                                txid,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            }).await;
+                            state2
+                                .record_portfolio_event(PortfolioEvent::BagsFee {
+                                    amount_usdc: fee as f64 / 1_000_000.0,
+                                    txid,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                })
+                                .await;
                         }
                         Err(e) => tracing::warn!("Bags swap fee failed: {e}"),
                     }
@@ -308,22 +374,21 @@ pub async fn trade_swap_handler(
     }
 
     // 5b. Record swap event in portfolio history
-    state.record_portfolio_event(PortfolioEvent::Swap {
-        input_mint: req.input_mint.clone(),
-        output_mint: req.output_mint.clone(),
-        input_amount: req.amount as f64 / 10f64.powi(input_decimals),
-        output_amount: out_amount as f64 / 10f64.powi(output_decimals),
-        txid: txid.clone(),
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    }).await;
+    state
+        .record_portfolio_event(PortfolioEvent::Swap {
+            input_mint: req.input_mint.clone(),
+            output_mint: req.output_mint.clone(),
+            input_amount: req.amount as f64 / 10f64.powi(input_decimals),
+            output_amount: out_amount as f64 / 10f64.powi(output_decimals),
+            txid: txid.clone(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        })
+        .await;
 
-    Json(SwapResponse {
-        out_amount,
-        txid,
-    }).into_response()
+    Json(SwapResponse { out_amount, txid }).into_response()
 }
 
 fn err_resp(code: StatusCode, msg: String) -> Response {
@@ -350,10 +415,14 @@ pub async fn trade_quote_handler(
     State(state): State<ApiState>,
     axum::extract::Query(query): axum::extract::Query<QuoteQuery>,
 ) -> Response {
-    if resolve_hosted_token(&headers).is_none() && require_api_secret_or_unauthorized(&state, &headers).is_some() {
+    if resolve_hosted_token(&headers).is_none()
+        && require_api_secret_or_unauthorized(&state, &headers).is_some()
+    {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized. require api secret or hosted token" })),
+            Json(
+                serde_json::json!({ "error": "unauthorized. require api secret or hosted token" }),
+            ),
         )
             .into_response();
     }
@@ -378,16 +447,29 @@ pub async fn trade_quote_handler(
 
     let res = match client.get(&quote_url).send().await {
         Ok(r) => r,
-        Err(e) => return err_resp(StatusCode::BAD_GATEWAY, format!("Jupiter request failed: {e}")),
+        Err(e) => {
+            return err_resp(
+                StatusCode::BAD_GATEWAY,
+                format!("Jupiter request failed: {e}"),
+            )
+        }
     };
 
     if !res.status().is_success() {
-        return err_resp(StatusCode::BAD_GATEWAY, format!("Jupiter Error: {}", res.status()));
+        return err_resp(
+            StatusCode::BAD_GATEWAY,
+            format!("Jupiter Error: {}", res.status()),
+        );
     }
 
     let json: serde_json::Value = match res.json().await {
         Ok(j) => j,
-        Err(_) => return err_resp(StatusCode::INTERNAL_SERVER_ERROR, "Invalid JSON from Jupiter".into()),
+        Err(_) => {
+            return err_resp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid JSON from Jupiter".into(),
+            )
+        }
     };
 
     Json(json).into_response()

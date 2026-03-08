@@ -80,6 +80,12 @@ pub struct Cli {
     /// Auto-submit on-chain challenges for highly anomalous agents. (Requires --keypair)
     #[arg(long)]
     pub auto_submit: bool,
+
+    /// Also auto-resolve submitted challenges.
+    /// Unsafe unless the challenger has a real contradiction proof, so this is
+    /// disabled by default.
+    #[arg(long)]
+    pub auto_resolve: bool,
 }
 
 // ============================================================================

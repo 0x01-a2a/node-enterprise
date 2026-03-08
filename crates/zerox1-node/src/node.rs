@@ -209,7 +209,10 @@ impl Zx01Node {
                         tracing::info!("Registered exempt agent: {}", hex_str);
                     }
                 } else {
-                    tracing::warn!("Invalid exempt agent length (expected 32 bytes): {}", hex_str);
+                    tracing::warn!(
+                        "Invalid exempt agent length (expected 32 bytes): {}",
+                        hex_str
+                    );
                 }
             } else {
                 tracing::warn!("Invalid hex for exempt agent: {}", hex_str);
@@ -243,9 +246,9 @@ impl Zx01Node {
                         tokio::runtime::Handle::current()
                             .block_on(api_client.resolve_distribution_address())
                     })
-                    .map_err(|e| anyhow::anyhow!(
-                        "Bags API unavailable and --bags-wallet not set: {e}"
-                    ))?
+                    .map_err(|e| {
+                        anyhow::anyhow!("Bags API unavailable and --bags-wallet not set: {e}")
+                    })?
                 };
                 tracing::info!(
                     "Bags fee-sharing enabled: {} bps → {}",
@@ -260,6 +263,16 @@ impl Zx01Node {
             }
         };
 
+        #[cfg(feature = "bags")]
+        let bags_launch: Option<std::sync::Arc<crate::bags::BagsLaunchClient>> =
+            config.bags_api_key.as_ref().map(|key| {
+                tracing::info!("Bags launch API enabled (key configured)");
+                std::sync::Arc::new(crate::bags::BagsLaunchClient::new(
+                    key.clone(),
+                    http_client.clone(),
+                ))
+            });
+
         let (api, outbound_rx, hosted_outbound_rx) = ApiState::new(
             identity.agent_id,
             config.agent_name.clone(),
@@ -267,6 +280,7 @@ impl Zx01Node {
             config.api_read_keys.clone(),
             config.hosting_fee_bps,
             config.rpc_url.clone(),
+            config.trade_rpc_url.clone(),
             http_client.clone(),
             config.registry_8004_collection.clone(),
             std::sync::Arc::new(identity.signing_key.clone()),
@@ -275,11 +289,15 @@ impl Zx01Node {
             exempt_persist_path,
             #[cfg(feature = "bags")]
             bags_config,
+            #[cfg(feature = "bags")]
+            bags_launch,
+            config.skill_workspace.clone(),
         );
 
         // Load portfolio history from disk
         let portfolio_path = config.log_dir.join("portfolio_history.json");
-        let _ = tokio::runtime::Handle::current().block_on(api.load_portfolio_history(portfolio_path));
+        let _ =
+            tokio::runtime::Handle::current().block_on(api.load_portfolio_history(portfolio_path));
 
         let batch = BatchAccumulator::new(epoch, 0);
         let logger = EnvelopeLogger::new(log_dir, epoch);
@@ -363,7 +381,11 @@ impl Zx01Node {
                         );
                     }
                     let api = self.api.clone();
-                    tokio::spawn(crate::api::serve(api, addr, self.config.api_cors_origins.clone()));
+                    tokio::spawn(crate::api::serve(
+                        api,
+                        addr,
+                        self.config.api_cors_origins.clone(),
+                    ));
                 }
                 Err(e) => tracing::warn!("Invalid --api-addr '{addr_str}': {e}"),
             }
@@ -544,7 +566,7 @@ impl Zx01Node {
                             self.verify_peer_lease(env.sender).await;
                         }
                     }
-                    
+
                     if !self.sati_gate_allows(&env.sender) {
                         tracing::warn!("Blocked hosted agent {} (unregistered)", hex::encode(env.sender));
                         continue;
@@ -619,7 +641,13 @@ impl Zx01Node {
     /// Called once at startup before check_own_lease().
     /// In dev mode, skip entirely.
     async fn ensure_stake_and_lease(&mut self) {
-        if self.dev_mode || self.exempt_agents.read().unwrap().contains(&self.identity.agent_id) {
+        if self.dev_mode
+            || self
+                .exempt_agents
+                .read()
+                .unwrap()
+                .contains(&self.identity.agent_id)
+        {
             tracing::debug!("Dev mode or exempt agent — skipping auto-onboard.");
             return;
         }
@@ -649,12 +677,9 @@ impl Zx01Node {
         match crate::lease::get_lease_status(&self.rpc, &self.identity.agent_id).await {
             Ok(None) => {
                 tracing::info!("No lease account found — auto-initializing lease...");
-                if let Err(e) = crate::lease::init_lease_onchain(
-                    &self.rpc,
-                    &self.identity,
-                    self.kora.as_ref(),
-                )
-                .await
+                if let Err(e) =
+                    crate::lease::init_lease_onchain(&self.rpc, &self.identity, self.kora.as_ref())
+                        .await
                 {
                     tracing::warn!("Auto-init lease failed: {e}. Agent may be rejected by peers.");
                 }
@@ -671,7 +696,13 @@ impl Zx01Node {
     /// - Grace period: warn, continue (but should pay ASAP)
     /// - Needs renewal: auto-renew immediately
     async fn check_own_lease(&mut self) -> anyhow::Result<()> {
-        if self.dev_mode || self.exempt_agents.read().unwrap().contains(&self.identity.agent_id) {
+        if self.dev_mode
+            || self
+                .exempt_agents
+                .read()
+                .unwrap()
+                .contains(&self.identity.agent_id)
+        {
             tracing::debug!("Dev mode or exempt agent — skipping own lease check.");
             return Ok(());
         }
@@ -722,7 +753,13 @@ impl Zx01Node {
     /// Check if own lease needs renewal and pay if so.
     /// Called at each epoch boundary.
     async fn maybe_renew_own_lease(&mut self) {
-        if self.dev_mode || self.exempt_agents.read().unwrap().contains(&self.identity.agent_id) {
+        if self.dev_mode
+            || self
+                .exempt_agents
+                .read()
+                .unwrap()
+                .contains(&self.identity.agent_id)
+        {
             return;
         }
         match lease::get_lease_status(&self.rpc, &self.identity.agent_id).await {
@@ -2041,7 +2078,8 @@ impl Zx01Node {
                 // moment the first peer subscribes.  Deduplicate: if one is
                 // already queued from a previous tick, replace it with the fresh
                 // (higher-nonce) envelope so peers always see the latest state.
-                self.pending_broadcasts.retain(|e| e.msg_type != MsgType::Beacon);
+                self.pending_broadcasts
+                    .retain(|e| e.msg_type != MsgType::Beacon);
                 if self.pending_broadcasts.len() < MAX_PENDING_BROADCASTS {
                     tracing::debug!("No mesh peers — queuing BEACON for flush");
                     self.pending_broadcasts.push(env);
@@ -2202,7 +2240,8 @@ impl Zx01Node {
             }
         }
         // Same TTL + cap for the 8004 HTTP failure cache.
-        self.reg8004_failures.retain(|_, ts| ts.elapsed() < sati_ttl);
+        self.reg8004_failures
+            .retain(|_, ts| ts.elapsed() < sati_ttl);
         if self.reg8004_failures.len() > MAX_REG8004_FAILURE_CACHE {
             let over = self.reg8004_failures.len() - MAX_REG8004_FAILURE_CACHE;
             let mut by_age: Vec<_> = self

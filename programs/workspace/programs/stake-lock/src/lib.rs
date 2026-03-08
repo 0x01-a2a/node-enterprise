@@ -160,22 +160,12 @@ pub mod stake_lock {
         // in_grace_period[1], deactivated[1]  => offset 98.
         {
             let data = ctx.accounts.lease_account.try_borrow_data()?;
-            require!(data.len() > 98, StakeLockError::AgentNotDeactivated);
-            require!(
-                ctx.accounts.lease_account.owner == &LEASE_PROGRAM_ID,
-                StakeLockError::InvalidLeaseAccount
-            );
-
-            let (expected_lease, _) = Pubkey::find_program_address(
-                &[b"lease", stake.agent_mint.as_ref()],
-                &LEASE_PROGRAM_ID,
-            );
-            require!(
-                ctx.accounts.lease_account.key() == expected_lease,
-                StakeLockError::InvalidLeaseAccount
-            );
-
-            let deactivated = data[98] != 0;
+            let deactivated = parse_lease_deactivated(
+                &ctx.accounts.lease_account.key(),
+                ctx.accounts.lease_account.owner,
+                &data,
+                &stake.agent_mint,
+            )?;
             require!(deactivated, StakeLockError::AgentNotDeactivated);
         }
         require!(!stake.in_unlock_queue, StakeLockError::AlreadyQueued);
@@ -256,11 +246,7 @@ pub mod stake_lock {
         let clock = Clock::get()?;
 
         // Compute current 0x01 epoch from on-chain clock.
-        let current_epoch = if clock.unix_timestamp >= GENESIS_TIMESTAMP {
-            ((clock.unix_timestamp - GENESIS_TIMESTAMP) as u64) / EPOCH_SECONDS
-        } else {
-            0
-        };
+        let current_epoch = current_epoch_from_unix_timestamp(clock.unix_timestamp);
 
         // Verify the agent_registry is the correct PDA for this stake account's
         // agent_mint under the BehaviorLog program.
@@ -280,23 +266,11 @@ pub mod stake_lock {
         // If the account doesn't exist (agent never submitted), treat next_epoch = 0.
         let next_epoch = {
             let data = ctx.accounts.agent_registry.try_borrow_data()?;
-            if data.len() >= REGISTRY_MIN_LEN {
-                require!(
-                    ctx.accounts.agent_registry.owner == &BEHAVIOR_LOG_PROGRAM_ID,
-                    StakeLockError::InvalidRegistryAccount,
-                );
-                u64::from_le_bytes(
-                    data[REGISTRY_NEXT_EPOCH_OFFSET..REGISTRY_NEXT_EPOCH_OFFSET + 8]
-                        .try_into()
-                        .unwrap(),
-                )
-            } else {
-                0u64
-            }
+            parse_registry_next_epoch(ctx.accounts.agent_registry.owner, &data)?
         };
 
         require!(
-            current_epoch > next_epoch + INACTIVITY_GRACE_EPOCHS,
+            is_inactive_for_slash(current_epoch, next_epoch),
             StakeLockError::AgentNotInactive,
         );
 
@@ -872,4 +846,96 @@ pub enum StakeLockError {
     Overflow,
     #[msg("recipient_usdc mint must match usdc_mint")]
     InvalidRecipientMint,
+}
+
+fn current_epoch_from_unix_timestamp(unix_timestamp: i64) -> u64 {
+    if unix_timestamp >= GENESIS_TIMESTAMP {
+        ((unix_timestamp - GENESIS_TIMESTAMP) as u64) / EPOCH_SECONDS
+    } else {
+        0
+    }
+}
+
+fn parse_lease_deactivated(
+    lease_key: &Pubkey,
+    lease_owner: &Pubkey,
+    data: &[u8],
+    agent_mint: &[u8; 32],
+) -> Result<bool> {
+    require!(data.len() > 98, StakeLockError::AgentNotDeactivated);
+    require!(
+        lease_owner == &LEASE_PROGRAM_ID,
+        StakeLockError::InvalidLeaseAccount
+    );
+
+    let (expected_lease, _) =
+        Pubkey::find_program_address(&[b"lease", agent_mint.as_ref()], &LEASE_PROGRAM_ID);
+    require!(
+        lease_key == &expected_lease,
+        StakeLockError::InvalidLeaseAccount
+    );
+
+    Ok(data[98] != 0)
+}
+
+fn parse_registry_next_epoch(registry_owner: &Pubkey, data: &[u8]) -> Result<u64> {
+    if data.len() < REGISTRY_MIN_LEN {
+        return Ok(0);
+    }
+
+    require!(
+        registry_owner == &BEHAVIOR_LOG_PROGRAM_ID,
+        StakeLockError::InvalidRegistryAccount,
+    );
+    Ok(u64::from_le_bytes(
+        data[REGISTRY_NEXT_EPOCH_OFFSET..REGISTRY_NEXT_EPOCH_OFFSET + 8]
+            .try_into()
+            .map_err(|_| error!(StakeLockError::InvalidRegistryAccount))?,
+    ))
+}
+
+fn is_inactive_for_slash(current_epoch: u64, next_epoch: u64) -> bool {
+    current_epoch > next_epoch.saturating_add(INACTIVITY_GRACE_EPOCHS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_registry_next_epoch_treats_uninitialized_account_as_zero() {
+        let next_epoch = parse_registry_next_epoch(&Pubkey::new_unique(), &[0u8; 8]).unwrap();
+        assert_eq!(next_epoch, 0);
+    }
+
+    #[test]
+    fn inactivity_slash_waits_until_after_full_grace_window() {
+        let next_epoch = 10;
+        assert!(!is_inactive_for_slash(
+            next_epoch + INACTIVITY_GRACE_EPOCHS,
+            next_epoch
+        ));
+        assert!(!is_inactive_for_slash(
+            next_epoch + INACTIVITY_GRACE_EPOCHS,
+            next_epoch
+        ));
+        assert!(is_inactive_for_slash(
+            next_epoch + INACTIVITY_GRACE_EPOCHS + 1,
+            next_epoch
+        ));
+    }
+
+    #[test]
+    fn parse_lease_deactivated_rejects_wrong_pda() {
+        let wrong_key = Pubkey::new_unique();
+        let mut data = vec![0u8; 99];
+        data[98] = 1;
+
+        assert!(parse_lease_deactivated(&wrong_key, &LEASE_PROGRAM_ID, &data, &[9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn current_epoch_clamps_pre_genesis_to_zero() {
+        assert_eq!(current_epoch_from_unix_timestamp(GENESIS_TIMESTAMP - 1), 0);
+    }
 }

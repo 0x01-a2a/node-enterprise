@@ -184,7 +184,10 @@ async fn main() -> anyhow::Result<()> {
             "/agents/{agent_id}/propose-owner",
             post(api::post_propose_owner),
         )
-        .route("/agents/{agent_id}/claim-owner", post(api::post_claim_owner))
+        .route(
+            "/agents/{agent_id}/claim-owner",
+            post(api::post_claim_owner),
+        )
         // Public ownership lookup — mobile app needs this without an API key
         .route("/agents/{agent_id}/owner", get(api::get_agent_owner))
         .route("/agents/by-owner/{wallet}", get(api::get_agents_by_owner))

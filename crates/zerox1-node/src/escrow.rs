@@ -333,12 +333,12 @@ fn build_approve_payment_ix(accs: ApprovePaymentAccounts) -> Instruction {
     // Account order must match ApprovePayment<'info> struct field order.
     let accounts = vec![
         AccountMeta::new_readonly(*accs.approver, true), // approver (signer)
-        AccountMeta::new(*accs.escrow_key, false),       // escrow_account (writable, close=requester)
-        AccountMeta::new(*accs.requester_key, false),    // requester (writable, target for close)
+        AccountMeta::new(*accs.escrow_key, false), // escrow_account (writable, close=requester)
+        AccountMeta::new(*accs.requester_key, false), // requester (writable, target for close)
         AccountMeta::new_readonly(*accs.vault_auth, false), // escrow_vault_authority
-        AccountMeta::new(*accs.vault_ata, false),        // escrow_vault (writable)
-        AccountMeta::new(*accs.provider_ata, false),     // provider_usdc (writable)
-        AccountMeta::new(*accs.treasury_ata, false),     // treasury_usdc (writable)
+        AccountMeta::new(*accs.vault_ata, false),  // escrow_vault (writable)
+        AccountMeta::new(*accs.provider_ata, false), // provider_usdc (writable)
+        AccountMeta::new(*accs.treasury_ata, false), // treasury_usdc (writable)
         AccountMeta::new_readonly(*accs.treasury_key, false), // treasury
         AccountMeta::new(*accs.notary_ata, false), // notary_usdc (writable)
         AccountMeta::new_readonly(*accs.usdc, false), // usdc_mint

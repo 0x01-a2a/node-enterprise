@@ -406,6 +406,15 @@ async fn execute_challenge(
     )
     .await?;
 
+    if !cli.auto_resolve {
+        tracing::warn!(
+            "Challenge submitted for agent {} epoch {}. Skipping auto-resolve because contradiction proofs still require operator judgment.",
+            entry.agent_id,
+            entry.epoch
+        );
+        return Ok(());
+    }
+
     tracing::info!(
         "Resolving on-chain challenge for agent {} epoch {}",
         entry.agent_id,

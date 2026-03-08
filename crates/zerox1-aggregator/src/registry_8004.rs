@@ -32,7 +32,8 @@ impl Registry8004Client {
     /// Check if an agent (identified by base58 pubkey) is registered in 8004.
     pub async fn is_registered_b58(&self, agent_b58: &str) -> anyhow::Result<bool> {
         let (query, variables) = if self.min_tier > 0 {
-            let q = "query($o:String!,$t:Int!){agents(first:1,where:{owner:$o,trustTier_gte:$t}){id}}";
+            let q =
+                "query($o:String!,$t:Int!){agents(first:1,where:{owner:$o,trustTier_gte:$t}){id}}";
             let v = serde_json::json!({ "o": agent_b58, "t": self.min_tier as i32 });
             (q, v)
         } else {

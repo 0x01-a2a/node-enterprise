@@ -83,7 +83,10 @@ pub mod escrow {
         timeout_slots: u64,
     ) -> Result<()> {
         #[cfg(not(feature = "localtest"))]
-        require!(ctx.accounts.usdc_mint.key() == USDC_MINT, EscrowError::InvalidMint);
+        require!(
+            ctx.accounts.usdc_mint.key() == USDC_MINT,
+            EscrowError::InvalidMint
+        );
 
         require!(amount > 0, EscrowError::ZeroAmount);
         require!(
@@ -244,17 +247,15 @@ pub mod escrow {
         }
 
         // Close vault ATA — return rent (~0.002 SOL) to requester.
-        token::close_account(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                CloseAccount {
-                    account: ctx.accounts.escrow_vault.to_account_info(),
-                    destination: ctx.accounts.requester.to_account_info(),
-                    authority: ctx.accounts.escrow_vault_authority.to_account_info(),
-                },
-                vault_auth_seeds,
-            ),
-        )?;
+        token::close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.escrow_vault.to_account_info(),
+                destination: ctx.accounts.requester.to_account_info(),
+                authority: ctx.accounts.escrow_vault_authority.to_account_info(),
+            },
+            vault_auth_seeds,
+        ))?;
 
         let _ = seeds; // suppress unused warning
         msg!(
@@ -333,17 +334,15 @@ pub mod escrow {
         }
 
         // Close vault ATA — return rent (~0.002 SOL) to requester.
-        token::close_account(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                CloseAccount {
-                    account: ctx.accounts.escrow_vault.to_account_info(),
-                    destination: ctx.accounts.requester.to_account_info(),
-                    authority: ctx.accounts.escrow_vault_authority.to_account_info(),
-                },
-                vault_auth_seeds,
-            ),
-        )?;
+        token::close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.escrow_vault.to_account_info(),
+                destination: ctx.accounts.requester.to_account_info(),
+                authority: ctx.accounts.escrow_vault_authority.to_account_info(),
+            },
+            vault_auth_seeds,
+        ))?;
 
         let _ = (requester, provider, conv_id, bump);
         msg!(
@@ -402,17 +401,15 @@ pub mod escrow {
         )?;
 
         // Close vault ATA — return rent (~0.002 SOL) to requester.
-        token::close_account(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                CloseAccount {
-                    account: ctx.accounts.escrow_vault.to_account_info(),
-                    destination: ctx.accounts.requester.to_account_info(),
-                    authority: ctx.accounts.escrow_vault_authority.to_account_info(),
-                },
-                vault_auth_seeds,
-            ),
-        )?;
+        token::close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.escrow_vault.to_account_info(),
+                destination: ctx.accounts.requester.to_account_info(),
+                authority: ctx.accounts.escrow_vault_authority.to_account_info(),
+            },
+            vault_auth_seeds,
+        ))?;
 
         let _ = (requester, provider, conv_id, bump);
         msg!("Escrow cancelled: {} USDC returned to requester", total);
@@ -608,7 +605,6 @@ pub struct CancelEscrow<'info> {
         bump  = escrow_account.bump,
     )]
     pub escrow_account: Account<'info, EscrowAccount>,
-
 
     #[account(
         seeds = [b"escrow_vault", escrow_account.key().as_ref()],

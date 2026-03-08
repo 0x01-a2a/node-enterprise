@@ -58,14 +58,20 @@ pub fn build_register_tx(
     fee_payer_override: Option<Pubkey>,
 ) -> anyhow::Result<RegisterPrepared> {
     let program_id: Pubkey = if is_mainnet {
-        PROGRAM_ID_MAINNET.parse().expect("hardcoded mainnet program id")
+        PROGRAM_ID_MAINNET
+            .parse()
+            .expect("hardcoded mainnet program id")
     } else {
-        PROGRAM_ID_DEVNET.parse().expect("hardcoded devnet program id")
+        PROGRAM_ID_DEVNET
+            .parse()
+            .expect("hardcoded devnet program id")
     };
 
     let collection: Pubkey = match collection_override {
         Some(c) => c,
-        None if !is_mainnet => COLLECTION_DEVNET.parse().expect("hardcoded devnet collection"),
+        None if !is_mainnet => COLLECTION_DEVNET
+            .parse()
+            .expect("hardcoded devnet collection"),
         None => anyhow::bail!(
             "mainnet 8004 collection address required — set ZX01_REGISTRY_8004_COLLECTION"
         ),
@@ -83,8 +89,7 @@ pub fn build_register_tx(
     let asset_pubkey = asset_kp.pubkey();
 
     // Derive PDAs.
-    let (root_config, _) =
-        Pubkey::find_program_address(&[b"root_config"], &program_id);
+    let (root_config, _) = Pubkey::find_program_address(&[b"root_config"], &program_id);
     let (registry_config, _) =
         Pubkey::find_program_address(&[b"registry_config", collection.as_ref()], &program_id);
     let (agent_account, _) =
@@ -238,13 +243,14 @@ impl Registry8004Client {
         // "does this owner have ANY agent with tier >= min_tier?" rather than
         // checking the tier of whichever asset happens to be returned first.
         let (query, variables) = if self.min_tier > 0 {
-            let q = "query($o:String!,$t:Int!){agents(first:1,where:{owner:$o,trustTier_gte:$t}){id}}";
+            let q =
+                "query($o:String!,$t:Int!){agents(first:1,where:{owner:$o,trustTier_gte:$t}){id}}";
             let v = serde_json::json!({ "o": owner_b58, "t": self.min_tier as i32 });
             (q, v)
         } else {
             let q = "query($o:String!){agents(first:1,where:{owner:$o}){id}}";
-            let v = serde_json::json!({ "o": owner_b58 })
-            ;(q, v)
+            let v = serde_json::json!({ "o": owner_b58 });
+            (q, v)
         };
 
         let body = serde_json::json!({ "query": query, "variables": variables });

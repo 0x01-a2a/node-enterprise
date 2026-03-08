@@ -19,7 +19,12 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-use crate::{api::{ApiState, PortfolioEvent}, identity::AgentIdentity, kora::KoraClient, lease::get_ata};
+use crate::{
+    api::{ApiState, PortfolioEvent},
+    identity::AgentIdentity,
+    kora::KoraClient,
+    lease::get_ata,
+};
 
 // ============================================================================
 // Constants — must match stake-lock program
@@ -225,7 +230,8 @@ async fn submit_slash_inactive(
             &[&solana_kp],
             recent_blockhash,
         );
-        rpc.send_and_confirm_transaction(&tx).await
+        rpc.send_and_confirm_transaction(&tx)
+            .await
             .map_err(|e| anyhow::anyhow!("send_and_confirm: {e}"))?;
     }
 
@@ -239,7 +245,8 @@ async fn submit_slash_inactive(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-    }).await;
+    })
+    .await;
 
     Ok(())
 }

@@ -54,7 +54,10 @@ pub struct AppState {
 /// Check if the request carries a valid API key.
 /// Returns None (pass) if api_keys is empty (dev mode) or the token matches.
 /// Returns Some(401) if api_keys is configured but the token is missing/invalid.
-pub fn require_api_key(state: &AppState, headers: &HeaderMap) -> Option<(StatusCode, Json<serde_json::Value>)> {
+pub fn require_api_key(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
     if state.api_keys.is_empty() {
         return None; // No keys configured — public access (dev mode)
     }
@@ -73,7 +76,9 @@ pub fn require_api_key(state: &AppState, headers: &HeaderMap) -> Option<(StatusC
 
     Some((
         StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "unauthorized — provide a valid API key via Authorization: Bearer <key>" })),
+        Json(
+            json!({ "error": "unauthorized — provide a valid API key via Authorization: Bearer <key>" }),
+        ),
     ))
 }
 
@@ -192,7 +197,9 @@ pub async fn ingest_envelope(
     tracing::debug!("Ingest: received event: {:?}", event);
     if let Some(activity) = state.store.ingest(event) {
         if let Err(e) = state.activity_tx.send(activity) {
-            tracing::warn!("Activity broadcast dropped (no active subscribers or channel full): {e}");
+            tracing::warn!(
+                "Activity broadcast dropped (no active subscribers or channel full): {e}"
+            );
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -263,9 +270,12 @@ pub async fn get_agents(
     Query(params): Query<AgentsParams>,
 ) -> impl IntoResponse {
     let limit = params.limit.min(200);
-    let agents = state
-        .store
-        .list_agents(limit, params.offset, &params.sort, params.country.as_deref());
+    let agents = state.store.list_agents(
+        limit,
+        params.offset,
+        &params.sort,
+        params.country.as_deref(),
+    );
     Json(agents)
 }
 
@@ -726,23 +736,24 @@ pub struct PostPendingBody {
     pub payload: String,
 }
 
+fn decode_pubkey_bytes(pubkey: &str) -> Result<[u8; 32], StatusCode> {
+    let bytes = if let Ok(decoded) = hex::decode(pubkey) {
+        decoded
+    } else if let Ok(decoded) = bs58::decode(pubkey).into_vec() {
+        decoded
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+
+    bytes.try_into().map_err(|_| StatusCode::BAD_REQUEST)
+}
+
 /// Helper to verify Ed25519 signature from headers.
-fn verify_request_signature(
-    agent_id: &str,
-    signature: &str,
-    body: &[u8],
-) -> Result<(), StatusCode> {
+fn verify_request_signature(pubkey: &str, signature: &str, body: &[u8]) -> Result<(), StatusCode> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-    let pubkey_bytes = hex::decode(agent_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-    if pubkey_bytes.len() != 32 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let pubkey_arr: [u8; 32] = pubkey_bytes
-        .try_into()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let pubkey = VerifyingKey::from_bytes(&pubkey_arr)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let pubkey_arr = decode_pubkey_bytes(pubkey)?;
+    let pubkey = VerifyingKey::from_bytes(&pubkey_arr).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let sig_bytes = hex::decode(signature).map_err(|_| StatusCode::BAD_REQUEST)?;
     let sig = Signature::from_slice(&sig_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -1195,8 +1206,29 @@ pub struct ClaimOwnerBody {
 pub async fn post_propose_owner(
     Path(agent_id): Path<String>,
     State(state): State<AppState>,
-    Json(body): Json<ProposeOwnerBody>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
+    let body_str = match std::str::from_utf8(&body_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid request body" })),
+            )
+        }
+    };
+    let body: ProposeOwnerBody = match serde_json::from_str(body_str) {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid request body" })),
+            )
+        }
+    };
+
     if !is_valid_agent_id(&agent_id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1208,6 +1240,16 @@ pub async fn post_propose_owner(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid proposed_owner (expected base58 Solana address)" })),
+        );
+    }
+    if let Some(s) = sig {
+        if let Err(status) = verify_request_signature(&agent_id, s, &body_bytes) {
+            return (status, Json(json!({ "error": "invalid agent signature" })));
+        }
+    } else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing X-Signature" })),
         );
     }
 
@@ -1232,8 +1274,29 @@ pub async fn post_propose_owner(
 pub async fn post_claim_owner(
     Path(agent_id): Path<String>,
     State(state): State<AppState>,
-    Json(body): Json<ClaimOwnerBody>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
+    let body_str = match std::str::from_utf8(&body_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid request body" })),
+            )
+        }
+    };
+    let body: ClaimOwnerBody = match serde_json::from_str(body_str) {
+        Ok(body) => body,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid request body" })),
+            )
+        }
+    };
+
     if !is_valid_agent_id(&agent_id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1244,6 +1307,16 @@ pub async fn post_claim_owner(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "invalid owner_wallet (expected base58 Solana address)" })),
+        );
+    }
+    if let Some(s) = sig {
+        if let Err(status) = verify_request_signature(&body.owner_wallet, s, &body_bytes) {
+            return (status, Json(json!({ "error": "invalid owner signature" })));
+        }
+    } else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing X-Signature" })),
         );
     }
 
@@ -1289,7 +1362,11 @@ pub async fn get_agents_by_owner(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if wallet.len() < 32 || wallet.len() > 44 {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid wallet" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid wallet" })),
+        )
+            .into_response();
     }
     let agents = state.store.get_agents_by_owner(&wallet);
     Json(agents).into_response()
@@ -1347,10 +1424,7 @@ pub async fn post_blob(
         .and_then(|h| h.to_str().ok())
         .unwrap_or(agent_id_hex); // dev-mode fallback: signer == agent_id
 
-    if !is_valid_agent_id(agent_id_hex)
-        || timestamp_str.is_empty()
-        || signature_hex.len() != 128
-    {
+    if !is_valid_agent_id(agent_id_hex) || timestamp_str.is_empty() || signature_hex.len() != 128 {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "missing or invalid X-0x01 headers" })),
@@ -1552,5 +1626,39 @@ pub async fn get_blob(State(state): State<AppState>, Path(cid): Path<String>) ->
             Json(json!({ "error": "failed to read blob" })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn verify_request_signature_accepts_hex_pubkeys() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let body = br#"{"ok":true}"#;
+        let sig = signing_key.sign(body);
+
+        assert!(verify_request_signature(
+            &hex::encode(signing_key.verifying_key().to_bytes()),
+            &hex::encode(sig.to_bytes()),
+            body
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn verify_request_signature_accepts_base58_pubkeys() {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let body = br#"{"owner_wallet":"11111111111111111111111111111111"}"#;
+        let sig = signing_key.sign(body);
+
+        assert!(verify_request_signature(
+            &bs58::encode(signing_key.verifying_key().to_bytes()).into_string(),
+            &hex::encode(sig.to_bytes()),
+            body
+        )
+        .is_ok());
     }
 }
