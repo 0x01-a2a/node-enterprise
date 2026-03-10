@@ -267,6 +267,11 @@ impl BagsLaunchClient {
 
     /// Step 1 — Create IPFS token metadata and derive the mint address.
     ///
+    /// Pass either `image_bytes` (raw PNG/JPG/GIF/WebP, max 15 MB) **or**
+    /// `image_url` (HTTPS URL) — Bags rejects requests that supply both.
+    /// When bytes are provided the request is sent as `multipart/form-data`;
+    /// otherwise a plain JSON body is used.
+    ///
     /// Returns `(token_mint_b58, ipfs_uri)`.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_token_info(
@@ -274,32 +279,74 @@ impl BagsLaunchClient {
         name: &str,
         symbol: &str,
         description: &str,
+        image_bytes: Option<Vec<u8>>,
         image_url: Option<&str>,
         website_url: Option<&str>,
         twitter_url: Option<&str>,
         telegram_url: Option<&str>,
     ) -> anyhow::Result<(String, String)> {
-        let mut body = serde_json::json!({
-            "name": name,
-            "symbol": symbol,
-            "description": description,
-        });
-        if let Some(u) = image_url {
-            body["imageUrl"] = u.into();
-        }
-        if let Some(u) = website_url {
-            body["websiteUrl"] = u.into();
-        }
-        if let Some(u) = twitter_url {
-            body["twitterUrl"] = u.into();
-        }
-        if let Some(u) = telegram_url {
-            body["telegramUrl"] = u.into();
+        let url = format!("{}/token-launch/create-token-info", self.api_url);
+
+        let resp = if let Some(bytes) = image_bytes {
+            // ── multipart/form-data path ───────────────────────────────────
+            let image_part = reqwest::multipart::Part::bytes(bytes)
+                .file_name("image.png")
+                .mime_str("image/png")
+                .map_err(|e| anyhow!("invalid mime type: {e}"))?;
+
+            let mut form = reqwest::multipart::Form::new()
+                .text("name", name.to_string())
+                .text("symbol", symbol.to_string())
+                .text("description", description.to_string())
+                .part("image", image_part);
+
+            if let Some(u) = website_url {
+                form = form.text("website", u.to_string());
+            }
+            if let Some(u) = twitter_url {
+                form = form.text("twitter", u.to_string());
+            }
+            if let Some(u) = telegram_url {
+                form = form.text("telegram", u.to_string());
+            }
+
+            self.client
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .multipart(form)
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await
+                .map_err(|e| anyhow!("Bags API POST create-token-info (multipart) failed: {e}"))?
+        } else {
+            // ── JSON path (imageUrl or no image) ──────────────────────────
+            let mut body = serde_json::json!({
+                "name": name,
+                "symbol": symbol,
+                "description": description,
+            });
+            if let Some(u) = image_url {
+                body["imageUrl"] = u.into();
+            }
+            if let Some(u) = website_url {
+                body["websiteUrl"] = u.into();
+            }
+            if let Some(u) = twitter_url {
+                body["twitterUrl"] = u.into();
+            }
+            if let Some(u) = telegram_url {
+                body["telegramUrl"] = u.into();
+            }
+            self.post_json("token-launch/create-token-info", &body).await?
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Bags API create-token-info returned {status}: {text}"));
         }
 
-        let r: CreateTokenInfoResponse = self
-            .post_json("token-launch/create-token-info", &body)
-            .await?
+        let r: CreateTokenInfoResponse = resp
             .json()
             .await
             .map_err(|e| anyhow!("Bags create-token-info parse error: {e}"))?;

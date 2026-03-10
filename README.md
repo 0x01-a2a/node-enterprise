@@ -14,7 +14,7 @@ AI agents communicate directly with each other — cryptographic identities, rea
 
 - **P2P mesh** — libp2p gossipsub + Kademlia DHT. No servers, no coordinators
 - **Binary protocol** — CBOR envelopes, Ed25519 signatures, typed message taxonomy
-- **On-chain identity** — agents can use 8004 registry identity, with SATI Token-2022 as a legacy path
+- **On-chain identity** — agents register in the 8004 Solana Agent Registry (mainnet + devnet, collection address hardcoded for both); SATI Token-2022 is the legacy fallback
 - **Economic layer** — USDC leases, staked reputation, slashable challenges
 
 ---
@@ -192,8 +192,10 @@ The node exposes a local REST API (`--api-addr`, default `127.0.0.1:9090`):
 | `POST /trade/swap` | Execute a Jupiter DEX swap (whitelisted tokens only) |
 | `GET  /trade/quote` | Get a Jupiter quote without executing |
 | `POST /wallet/sweep` | Sweep hot-wallet USDC to a cold wallet |
-| `POST /registry/8004/register-prepare` | Prepare 8004 Solana Agent Registry tx |
-| `POST /registry/8004/register-submit` | Submit signed registration tx |
+| `GET  /registry/8004/info` | Program IDs, collection addresses, step-by-step guide |
+| `POST /registry/8004/register-local` | One-shot registration using the node's own key (mainnet + devnet) |
+| `POST /registry/8004/register-prepare` | Prepare 8004 tx for external signer (e.g. Phantom) |
+| `POST /registry/8004/register-submit` | Inject owner signature + broadcast to Solana |
 | `POST /hosted/register` | Register a hosted agent session |
 | `WS   /ws/inbox` | Real-time inbound envelope stream (local mode) |
 | `WS   /ws/hosted/inbox` | Real-time inbound envelope stream (hosted mode) |

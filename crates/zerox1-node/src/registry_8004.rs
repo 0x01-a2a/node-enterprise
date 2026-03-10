@@ -16,6 +16,12 @@ use solana_sdk::{
 pub const PROGRAM_ID_DEVNET: &str = "8oo4J9tBB3Hna1jRQ3rWvJjojqM5DYTDJo5cejUuJy3C";
 pub const PROGRAM_ID_MAINNET: &str = "8oo4dC4JvBLwy5tGgiH3WwK4B9PWxL9Z4XjA2jzkQMbQ";
 pub const COLLECTION_DEVNET: &str = "C6W2bq4BoVT8FDvqhdp3sbcHFBjNBXE8TsNak2wTXQs9";
+pub const COLLECTION_MAINNET: &str = "DbjsWo7iUs7QZyJxLgNyVxvAAjQZCXroJHoGok8h8Umg";
+/// Mainnet Solana RPC — used exclusively for 8004 registration so that the
+/// registration always lands on mainnet regardless of the mesh RPC setting.
+pub const RPC_MAINNET: &str = "https://api.mainnet-beta.solana.com";
+/// Devnet Solana RPC — used for 8004 registration when devnet is explicitly requested.
+pub const RPC_DEVNET: &str = "https://api.devnet.solana.com";
 const MPL_CORE_PROGRAM: &str = "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d";
 /// `register` instruction discriminator from the IDL.
 const REGISTER_DISCRIMINATOR: [u8; 8] = [211, 124, 67, 15, 211, 194, 178, 240];
@@ -72,9 +78,9 @@ pub fn build_register_tx(
         None if !is_mainnet => COLLECTION_DEVNET
             .parse()
             .expect("hardcoded devnet collection"),
-        None => anyhow::bail!(
-            "mainnet 8004 collection address required — set ZX01_REGISTRY_8004_COLLECTION"
-        ),
+        None => COLLECTION_MAINNET
+            .parse()
+            .expect("hardcoded mainnet collection"),
     };
 
     let mpl_core: Pubkey = MPL_CORE_PROGRAM.parse().expect("hardcoded mpl core");

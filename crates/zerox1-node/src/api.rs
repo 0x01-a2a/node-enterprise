@@ -54,8 +54,8 @@ use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use crate::{
     kora::KoraClient,
     registry_8004::{
-        broadcast_transaction, build_register_tx, fetch_latest_blockhash, COLLECTION_DEVNET,
-        PROGRAM_ID_DEVNET, PROGRAM_ID_MAINNET,
+        broadcast_transaction, build_register_tx, fetch_latest_blockhash, PROGRAM_ID_DEVNET,
+        PROGRAM_ID_MAINNET,
     },
 };
 
@@ -919,9 +919,11 @@ async fn get_reputation(
     let rep = state.0.reputation.read().await;
     match rep.get(&arr) {
         Some(snap) => Json(serde_json::to_value(snap).unwrap_or_default()).into_response(),
-        None => {
-            Json(serde_json::json!({ "agent_id": agent_id_hex, "score": null })).into_response()
-        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no reputation data" })),
+        )
+            .into_response(),
     }
 }
 
@@ -2357,9 +2359,9 @@ async fn registry_8004_info(State(state): State<ApiState>) -> Response {
         .registry_8004_collection
         .as_deref()
         .unwrap_or(if state.0.is_mainnet {
-            "(query RootConfig or set ZX01_REGISTRY_8004_COLLECTION)"
+            crate::registry_8004::COLLECTION_MAINNET
         } else {
-            COLLECTION_DEVNET
+            crate::registry_8004::COLLECTION_DEVNET
         });
 
     Json(serde_json::json!({
@@ -2367,11 +2369,7 @@ async fn registry_8004_info(State(state): State<ApiState>) -> Response {
         "program_id":  program_id,
         "collection":  collection,
         "mpl_core":    "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d",
-        "indexer_url": if state.0.is_mainnet {
-            "https://8004.qnt.sh/v2/graphql"
-        } else {
-            "https://8004-indexer-production.up.railway.app/v2/graphql"
-        },
+        "indexer_url": "https://8004-indexer-production.up.railway.app/v2/graphql",
         "register_via_node": {
             "prepare": "POST /registry/8004/register-prepare",
             "submit":  "POST /registry/8004/register-submit",
@@ -3715,6 +3713,9 @@ struct BagsLaunchRequest {
     name: String,
     symbol: String,
     description: String,
+    /// Raw image bytes, base64-encoded. Mutually exclusive with `image_url`.
+    /// Bags API accepts PNG/JPG/GIF/WebP up to 15 MB.
+    image_bytes: Option<String>,
     image_url: Option<String>,
     website_url: Option<String>,
     twitter_url: Option<String>,
@@ -3776,6 +3777,40 @@ async fn bags_launch_handler(
         )
             .into_response();
     }
+    // Reject supplying both image_bytes and image_url — Bags API enforces oneOf.
+    if req.image_bytes.is_some() && req.image_url.is_some() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "provide either image_bytes or image_url, not both"})),
+        )
+            .into_response();
+    }
+
+    // Decode and size-check image_bytes when present (15 MB limit from Bags API).
+    const MAX_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+    let decoded_image: Option<Vec<u8>> = if let Some(ref b64) = req.image_bytes {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        match B64.decode(b64) {
+            Ok(bytes) if bytes.len() <= MAX_IMAGE_BYTES => Some(bytes),
+            Ok(_) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "image_bytes exceeds 15 MB limit"})),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "image_bytes is not valid base64"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
+
     for u in [
         req.image_url.as_deref(),
         req.website_url.as_deref(),
@@ -3799,6 +3834,7 @@ async fn bags_launch_handler(
             &req.name,
             &req.symbol,
             &req.description,
+            decoded_image,
             req.image_url.as_deref(),
             req.website_url.as_deref(),
             req.twitter_url.as_deref(),

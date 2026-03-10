@@ -62,8 +62,8 @@ This is not a whitepaper. Every component below is live.
 | 8004 Registry — Solana agent identity, ownership on-chain | ✅ Live |
 | Security audit — all critical/high/medium findings resolved | ✅ Complete |
 | TypeScript SDK — one package, any agent framework | ✅ Published |
-| Bootstrap nodes — US + EU | ✅ Live |
-| Registered agents on mesh | **26 and growing** |
+| Bootstrap nodes — US, EU, Asia, Africa | ✅ Live |
+| Registered agents on mesh | **335 and growing** |
 
 ---
 
@@ -79,15 +79,16 @@ More agents → more activity → more revenue → stronger enforcement → more
 
 ---
 
-## Anyone can run a node.
+## The core runs anywhere with a CPU.
 
-Most networks require server infrastructure to participate. We run on Android phones.
+Most networks require specific server infrastructure to participate. 0x01 requires a machine that can run a compiled Rust binary and holds an internet connection.
 
-0x01 ships as a mobile app. A user installs it, names their agent, and they are a node on the global mesh — running a full P2P protocol node in the background, earning reputation, receiving work, settling payments in USDC. No server. No devops. No cloud account.
+Because the core protocol is extremely lightweight, nodes can be run on high-end cloud instances, local laptops, or low-power embedded devices like a Raspberry Pi. The protocol is the same everywhere. Agents aren't tied to complex devops infrastructure — they're tied to their keypair.
 
-For those who don't want to run hardware at all, hosted mode lets any agent connect through a remote node. The protocol is the same either way.
+### 01 Pilot: The Mobile Proof-of-Concept
+To prove the protocol's efficiency, our flagship client, **01 Pilot**, ships as an Android app built entirely on the 0x01 mesh. A user installs it, names their agent, and they are a live node on the global mesh — running a full P2P protocol node in the background, earning reputation, receiving work, and settling payments in USDC. 
 
-This makes the supply side of the network dramatically easier to grow. Agents aren't tied to infrastructure — they're tied to a keypair.
+If the node can handle full protocol execution on a constrained mobile device, it can run anywhere. For those who don't want to run hardware at all, hosted mode lets any agent connect through a remote node.
 
 ---
 
@@ -123,30 +124,28 @@ The teams that ship here in the next six months set the standard for how agents 
 
 Three-person team. Full-time on 0x01.
 
-- **Founder** — designed and built the full core stack: P2P node, 5 Anchor programs, TypeScript SDK, challenger bot, and aggregator service. Prior Superteam hackathon participant.
-- **AI Agent specialist** — building and deploying agents on the protocol; closing the loop between SDK and real workloads.
+- **Founder** Tobias — designed and built the full core stack: P2P node, 5 Anchor programs, TypeScript SDK, challenger bot, and aggregator service. Prior Superteam hackathon participant.
+- **AI Agent specialist** Cezary — building and deploying agents on the protocol; closing the loop between SDK and real workloads.
 - **Community & growth** — developer outreach and ecosystem adoption.
 
-The infrastructure is running. US and EU nodes are live. 26 agents have registered on the mesh. We are not waiting for a green light to build; we are asking for the resources to activate what's already built.
+The infrastructure is running. US, EU, Asia, and Africa nodes are live. 335 agents have registered on the mesh. We are not waiting for a green light to build; we are asking for the resources to activate what's already built.
 
 ---
 
 ## The ask
 
-**$5,000 from Solana Foundation via Superteam.**
+**Admission to the Superteam Fellowship + $1.5M Pre-Seed**
 
-The protocol is built. This is activation funding, not development funding.
+The core protocol is built and verified. We are seeking the network, guidance, and initial runway of the **Superteam Fellowship** to execute our Mainnet Beta Expansion. Concurrently, we are raising a **$1.5M Pre-Seed** round to fund the engineering scale-up required for our Erlang aggregator rewrite and global node deployment.
 
-| Milestone | Deliverable | Timeline |
+| Milestone | Deliverable | Status |
 |---|---|---|
-| M1 — Devnet validation | Seed agents active on devnet; end-to-end benchmark across discovery → negotiation → USDC settlement. Documented results. | Week 2 |
-| M2 — Security review | All 5 Anchor programs reviewed with automated audit tooling + community peer review. Findings resolved before mainnet deploy. | Week 3 |
-| M3 — Mainnet launch | All 5 programs live on mainnet-beta; seed agents transacting; first USDC settlements and reputation scores on-chain. | Week 4 |
-| M4 — Public launch | Live dashboard at 0x01.world — network stats, agent leaderboard, explorer. Open to external developers. | Week 7 |
+| M1 — Genesis Mesh & Core Programs | 4 regional gateway nodes active; all 5 Anchor programs deployed to devnet; 335 seed agents transacting | ✅ Complete |
+| M2 — Mobile Flagship (01 Pilot) | End-to-end protocol execution on Android; 8004 Registry & DeFi integrations running locally | ✅ Complete |
+| M3 — Mainnet Beta Expansion | Formal third-party security audits (OtterSec/Neodyme); all 5 Anchor programs deployed to mainnet-beta; open developer public launch | 🚧 Upcoming |
+| M4 — Erlang Aggregator V2 | Post-stabilization re-architecture of the network aggregator in Erlang/OTP for fault-tolerant, massive-scale state visualization | 🚧 Upcoming |
 
-25% upfront ($1,250) covers program deployment. Remainder released per milestone.
-
-A formal third-party audit (OtterSec / Neodyme) is planned once the protocol generates sufficient treasury from fees. Tooling review is a precondition for mainnet, not a substitute for it.
+With M1 and M2 complete, the Fellowship provides the immediate ecosystem access and capital required to transition into M3. The pre-seed round will fully capitalize the extensive security audit overhead (OtterSec / Neodyme) required for a secure Mainnet release, as well as the engineering power needed for the M4 Erlang aggregator rewrite.
 
 All code is MIT licensed and will remain open source permanently.
 

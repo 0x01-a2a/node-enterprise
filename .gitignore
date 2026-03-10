@@ -15,6 +15,9 @@ node_modules/
 sdk/dist/
 sdk/*.tsbuildinfo
 
+# Anchor workspace — lock file is generated, not committed
+programs/workspace/package-lock.json
+
 # Secrets & keys — NEVER commit these
 .env
 .env.*
