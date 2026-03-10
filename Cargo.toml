@@ -2,11 +2,8 @@
 resolver = "2"
 members = [
     "crates/zerox1-protocol",
-    "crates/zerox1-node",
-    "crates/zerox1-sati-client",
+    "crates/zerox1-node-enterprise",
     "crates/zerox1-aggregator",
-    "crates/zerox1-simulator",
-    "crates/zerox1-challenger",
 ]
 
 [workspace.package]
@@ -27,12 +24,6 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 # Crypto / keys
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-
-# Solana
-solana-sdk = "2.1"
-solana-client = "2.1"
-solana-rpc-client = "2.1"
-solana-rpc-client-api = "2.1"
 
 # libp2p
 libp2p = { version = "0.54", features = [

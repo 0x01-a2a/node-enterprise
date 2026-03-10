@@ -10,7 +10,6 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use crate::registry_8004::Registry8004Client;
 use crate::store::{
     ActivityEvent, AgentProfile, AgentRegistryEntry, CapabilityMatch, DisputeRecord, HostingNode,
     IngestEvent, NetworkStats, OwnerStatus, PendingMessage, ReputationStore,
@@ -43,8 +42,8 @@ pub struct AppState {
     pub activity_tx: broadcast::Sender<ActivityEvent>,
     /// Path to store media blobs.
     pub blob_dir: Option<PathBuf>,
-    /// 8004 Agent Registry client for on-chain identity checks.
-    pub registry: Registry8004Client,
+    /// Maximum blob upload size in bytes (configurable via --max-blob-size).
+    pub max_blob_size: usize,
     /// API keys for gating read endpoints.
     /// Empty = public access (dev mode). When non-empty, all read endpoints
     /// require `Authorization: Bearer <key>` matching one of these values.
@@ -480,76 +479,6 @@ pub async fn get_calibrated_params(State(state): State<AppState>) -> impl IntoRe
 /// GET /system/sri
 pub async fn get_sri_status(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.store.sri_status())
-}
-
-// ============================================================================
-// GAP-08: Required stake
-// ============================================================================
-
-/// GET /stake/required/{agent_id}
-pub async fn get_required_stake(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-) -> impl IntoResponse {
-    Json(state.store.required_stake(&agent_id))
-}
-
-// ============================================================================
-// GAP-02: Capital flow graph
-// ============================================================================
-
-#[derive(Deserialize)]
-pub struct FlowParams {
-    /// Look-back window — same values as timeseries: "1h", "24h", "7d", "30d".
-    #[serde(default = "default_flow_window")]
-    window: String,
-    #[serde(default = "default_flow_limit")]
-    limit: usize,
-}
-
-fn default_flow_window() -> String {
-    "30d".to_string()
-}
-fn default_flow_limit() -> usize {
-    500
-}
-
-/// GET /graph/flow[?window=30d&limit=500]
-///
-/// Directed capital flow edges: (from, to, positive_flow, interaction_count).
-/// Pairs with high mutual flow are the primary Sybil signal.
-pub async fn get_flow_graph(
-    State(state): State<AppState>,
-    Query(params): Query<FlowParams>,
-) -> impl IntoResponse {
-    let window_secs = parse_window(&params.window);
-    let limit = params.limit.min(2_000);
-    Json(state.store.capital_flow_edges(window_secs, limit))
-}
-
-/// GET /graph/clusters[?window=30d]
-///
-/// Ownership clusters detected via mutual positive-feedback analysis.
-/// Each cluster's `c_coefficient` feeds β₃ in the stake multiplier.
-pub async fn get_flow_clusters(
-    State(state): State<AppState>,
-    Query(params): Query<FlowParams>,
-) -> impl IntoResponse {
-    let window_secs = parse_window(&params.window);
-    Json(state.store.flow_clusters(window_secs))
-}
-
-/// GET /graph/agent/{agent_id}[?window=30d]
-///
-/// Graph position for one agent: cluster membership, C coefficient,
-/// concentration ratio, and top counterparties.
-pub async fn get_agent_flow(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    Query(params): Query<FlowParams>,
-) -> impl IntoResponse {
-    let window_secs = parse_window(&params.window);
-    Json(state.store.agent_flow_info(&agent_id, window_secs))
 }
 
 // ============================================================================
@@ -1339,16 +1268,6 @@ pub async fn get_agent_owner(
     Path(agent_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    // Try 8004 registry first for on-chain ownership
-    if let Ok(Some(owner)) = state.registry.get_owner(&agent_id).await {
-        return Json(json!({
-            "status": "claimed",
-            "agent_id": agent_id,
-            "owner": owner,
-            "source": "8004_registry"
-        }));
-    }
-    // Fall back to legacy store
     let status: OwnerStatus = state.store.get_owner(&agent_id);
     Json(serde_json::to_value(status).unwrap_or_default())
 }
@@ -1417,12 +1336,23 @@ pub async fn post_blob(
         .get("X-0x01-Signature")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    // X-0x01-Signer is the actual Ed25519 verifying key, which may differ from
-    // agent_id in SATI mode (where agent_id = SATI mint address).
+    // Optional metadata — stored alongside the blob.
+    let filename = headers
+        .get("X-0x01-Filename")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let content_type = headers
+        .get("Content-Type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    // In enterprise mode agent_id = Ed25519 verifying key (hex), so signer == agent_id.
+    // X-0x01-Signer is accepted as an alias for forward-compatibility.
     let signer_hex = headers
         .get("X-0x01-Signer")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or(agent_id_hex); // dev-mode fallback: signer == agent_id
+        .unwrap_or(agent_id_hex);
 
     if !is_valid_agent_id(agent_id_hex) || timestamp_str.is_empty() || signature_hex.len() != 128 {
         return (
@@ -1459,17 +1389,15 @@ pub async fn post_blob(
     // 2. Verify Signature
     // Use X-0x01-Signer for the crypto check; it equals X-0x01-Agent-Id in
     // dev mode, but is the node's Ed25519 key in SATI/8004 mode.
-    // Try hex decoding first (legacy), then base58 (8004).
-    let signer_bytes = if let Ok(b) = hex::decode(signer_hex) {
-        b
-    } else if let Ok(b) = bs58::decode(signer_hex).into_vec() {
-        b
-    } else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid signer (expected hex or base58)" })),
-        )
-            .into_response();
+    let signer_bytes = match hex::decode(signer_hex) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid signer (expected 64-char hex Ed25519 key)" })),
+            )
+                .into_response()
+        }
     };
     let sig_bytes = match hex::decode(signature_hex) {
         Ok(b) => b,
@@ -1526,35 +1454,14 @@ pub async fn post_blob(
             .into_response();
     }
 
-    // 3. Tier Check
-    // Check 8004 registry for on-chain registration (replaces legacy is_claimed)
-    let score = state.store.get_agent_reputation_score(agent_id_hex);
-    let is_registered = state
-        .registry
-        .is_registered_b58(agent_id_hex)
-        .await
-        .unwrap_or(false);
-    let is_claimed = is_registered || state.store.is_agent_claimed(agent_id_hex);
-
-    let max_size = if is_claimed || score >= 100.0 {
-        10 * 1024 * 1024 // 10 MB
-    } else if score >= 50.0 {
-        2 * 1024 * 1024 // 2 MB
-    } else if score >= 10.0 {
-        512 * 1024 // 512 KB
-    } else {
-        0 // Tier 0: Disabled
-    };
-
-    if max_size == 0 {
+    // 3. Size check against the operator-configured limit.
+    let max_size = state.max_blob_size;
+    if body.len() > max_size {
         return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "reputation too low for blob storage" })),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "error": format!("blob too large (max {} bytes)", max_size) })),
         )
             .into_response();
-    }
-    if body.len() > max_size {
-        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({ "error": format!("blob too large for your tier (max {} bytes)", max_size) }))).into_response();
     }
 
     // 4. Store Blob
@@ -1574,13 +1481,31 @@ pub async fn post_blob(
             .into_response();
     }
 
+    // Write sidecar metadata file (.meta.json) for filename and content-type.
+    let meta = json!({
+        "filename":     filename,
+        "content_type": content_type,
+        "uploader":     agent_id_hex,
+        "size":         body.len(),
+    });
+    let meta_path = blob_dir.join(format!("{}.meta.json", &cid));
+    if let Err(e) = std::fs::write(&meta_path, meta.to_string()) {
+        tracing::warn!("Failed to write blob metadata {}: {}", cid, e);
+    }
+
     tracing::info!(
-        "Blob uploaded: cid={} from={} size={}",
+        "Blob uploaded: cid={} from={} size={} filename={:?}",
         &cid[..8],
         &agent_id_hex[..8],
-        body.len()
+        body.len(),
+        filename,
     );
-    (StatusCode::CREATED, Json(json!({ "cid": cid }))).into_response()
+    (StatusCode::CREATED, Json(json!({
+        "cid":          cid,
+        "filename":     filename,
+        "content_type": content_type,
+        "size":         body.len(),
+    }))).into_response()
 }
 
 /// GET /blobs/:cid
@@ -1614,18 +1539,95 @@ pub async fn get_blob(State(state): State<AppState>, Path(cid): Path<String>) ->
             .into_response();
     }
 
+    // Load optional sidecar metadata.
+    let meta_path = blob_dir.join(format!("{}.meta.json", &cid));
+    let (content_type, filename) = if let Ok(raw) = std::fs::read_to_string(&meta_path) {
+        if let Ok(m) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let ct = m["content_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let fn_ = m["filename"].as_str().unwrap_or("").to_string();
+            (ct, fn_)
+        } else {
+            ("application/octet-stream".to_string(), String::new())
+        }
+    } else {
+        ("application/octet-stream".to_string(), String::new())
+    };
+
     match std::fs::read(file_path) {
-        Ok(data) => (
-            StatusCode::OK,
-            [("Content-Type", "application/octet-stream")],
-            data,
-        )
-            .into_response(),
+        Ok(data) => {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Ok(v) = content_type.parse() {
+                headers.insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            if !filename.is_empty() {
+                let disposition = format!("inline; filename=\"{}\"", filename.replace('"', ""));
+                if let Ok(v) = disposition.parse() {
+                    headers.insert(axum::http::header::CONTENT_DISPOSITION, v);
+                }
+            }
+            (StatusCode::OK, headers, data).into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "failed to read blob" })),
         )
             .into_response(),
+    }
+}
+
+/// GET /blobs/:cid/meta
+///
+/// Returns the metadata sidecar for a blob (filename, content_type, size, uploader)
+/// without downloading the blob body itself.
+pub async fn get_blob_meta(
+    State(state): State<AppState>,
+    Path(cid): Path<String>,
+) -> impl IntoResponse {
+    let blob_dir = match state.blob_dir {
+        Some(ref d) => d,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "blob storage disabled" })),
+            )
+                .into_response()
+        }
+    };
+
+    if cid.len() != 64 || !cid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid cid" })),
+        )
+            .into_response();
+    }
+
+    let meta_path = blob_dir.join(format!("{}.meta.json", &cid));
+    match std::fs::read_to_string(&meta_path) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(mut m) => {
+                m["cid"] = serde_json::Value::String(cid);
+                Json(m).into_response()
+            }
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "corrupt metadata" })),
+            )
+                .into_response(),
+        },
+        Err(_) => {
+            // No meta sidecar — blob may predate metadata support.
+            let blob_path = blob_dir.join(&cid);
+            if blob_path.exists() {
+                Json(json!({ "cid": cid, "content_type": "application/octet-stream", "filename": "" }))
+                    .into_response()
+            } else {
+                (StatusCode::NOT_FOUND, Json(json!({ "error": "blob not found" }))).into_response()
+            }
+        }
     }
 }
 

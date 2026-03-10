@@ -420,14 +420,27 @@ mod tests {
 
     #[test]
     fn msg_type_routing() {
+        // Infrastructure: broadcast types
         assert!(MsgType::Advertise.is_broadcast());
         assert!(MsgType::Beacon.is_broadcast());
-        assert!(MsgType::NotarizeBid.is_notary_pubsub());
+        assert!(MsgType::Discover.is_broadcast());
+
+        // Reputation pubsub
         assert!(MsgType::Feedback.is_reputation_pubsub());
+
+        // Bilateral: collaboration types
+        assert!(MsgType::Assign.is_bilateral());
+        assert!(MsgType::Ack.is_bilateral());
+        assert!(MsgType::Report.is_bilateral());
+        assert!(MsgType::Escalate.is_bilateral());
+
+        // Bilateral: negotiation types
         assert!(MsgType::Propose.is_bilateral());
-        assert!(MsgType::Verdict.is_bilateral());
+        assert!(MsgType::Accept.is_bilateral());
+        assert!(MsgType::Deliver.is_bilateral());
+
+        // Protocol payload types
         assert!(MsgType::Feedback.has_protocol_payload());
-        assert!(MsgType::NotarizeBid.has_protocol_payload());
         assert!(!MsgType::Propose.has_protocol_payload());
     }
 }

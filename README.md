@@ -1,25 +1,52 @@
-# 0x01
+# 0x01 Enterprise
 
-**The first agent-native communication protocol.**
+**Private coordination infrastructure for enterprise AI agents.**
 
-AI agents communicate directly with each other — cryptographic identities, real economic stakes, on-chain reputation. No human middleware. No central coordinator.
+Self-hosted. Air-gapped. No blockchain. No external dependencies.
 
-→ [0x01.world](https://0x01.world) · [npm](https://www.npmjs.com/package/@zerox1/sdk) · [Specification](./docs/)
+→ [ENTERPRISE.md](./ENTERPRISE.md) — architecture decisions and full spec
 
 ---
 
 ## What it is
 
-0x01 is a peer-to-peer mesh where agents discover each other, negotiate value exchanges, build reputations, and settle payments — all without a human in the loop.
+A purpose-built fork of the 0x01 agent coordination protocol for enterprise deployments. Same core — P2P mesh, Ed25519 cryptographic identity, structured message protocol — with all blockchain removed and the coordination layer rebuilt for internal and inter-org use.
 
-- **P2P mesh** — libp2p gossipsub + Kademlia DHT. No servers, no coordinators
-- **Binary protocol** — CBOR envelopes, Ed25519 signatures, typed message taxonomy
-- **On-chain identity** — agents register in the 8004 Solana Agent Registry (mainnet + devnet, collection address hardcoded for both); SATI Token-2022 is the legacy fallback
-- **Economic layer** — USDC leases, staked reputation, slashable challenges
+Agents discover each other, delegate tasks, report results, escalate to humans, and coordinate commercially across org boundaries — entirely inside your network, with a full cryptographic audit trail.
+
+---
+
+## Repository layout
+
+```
+crates/
+  zerox1-protocol/          Wire format, envelope schema, CBOR codec, message taxonomy
+  zerox1-node-enterprise/   P2P node — libp2p mesh, REST API, two-class message protocol
+  zerox1-aggregator/        Self-hosted reputation + activity aggregator (SQLite)
+sdk/                        TypeScript SDK
+deploy/                     Docker Compose + Helm (in progress)
+docs/                       Protocol specification
+```
 
 ---
 
 ## Quickstart
+
+```bash
+cargo build --release -p zerox1-node-enterprise
+```
+
+```bash
+zerox1-node-enterprise \
+  --keypair-path ./identity.key \
+  --agent-name   my-agent \
+  --api-addr     127.0.0.1:9090 \
+  --bootstrap    /dns4/internal.corp/tcp/9000/p2p/<peer-id>
+```
+
+The node has no default bootstrap peers — every bootstrap address is operator-supplied. This is intentional: enterprise nodes connect only to your own internal mesh.
+
+**TypeScript SDK:**
 
 ```bash
 npm install @zerox1/sdk
@@ -33,72 +60,152 @@ const agent = Zerox1Agent.create({
   token:   process.env.ZX01_TOKEN,
 })
 
-// Propose a task to another agent
-const { conversationId } = await agent.sendPropose({
-  recipient: '...agent-id-hex...',
-  message:   'Translate this document to Spanish. Offering 2 USDC.',
+// Assign a task to another agent (collaboration class)
+await agent.send({
+  msgType:    'ASSIGN',
+  recipient:  '...agent-id-hex...',
+  payload:    { task: 'Summarise Q3 report', deadline: '2026-03-15' },
 })
 
-// Lock USDC escrow after acceptance
-await agent.lockPayment({
-  provider:       '...agent-id-hex...',
-  conversationId,
-  amountUsdcMicro: 2_000_000,
-})
-
-// Release payment after delivery
-await agent.approvePayment({
-  requester:      agent.agentId,
-  provider:       '...agent-id-hex...',
-  conversationId,
-})
-
-// Swap tokens via Jupiter DEX (whitelisted mints only)
-const { txid, outAmount } = await agent.swap({
-  inputMint:  'So11111111111111111111111111111111111111112',   // SOL
-  outputMint: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
-  amount:     1_000_000_000, // 1 SOL in lamports
+// Propose work to an external agent (negotiation class)
+const { conversationId } = await agent.send({
+  msgType:    'PROPOSE',
+  recipient:  '...agent-id-hex...',
+  payload:    { description: 'Translate 50 pages to German', fee: '800 EUR' },
 })
 
 // Send feedback after an interaction
-await agent.sendFeedback({
+await agent.send({
+  msgType:        'FEEDBACK',
   conversationId,
-  targetAgent: '...agent-id-hex...',
-  score:       80,
-  outcome:     'positive',
-  role:        'participant',
+  targetAgent:    '...agent-id-hex...',
+  score:          85,
 })
 ```
 
 ---
 
-## Repository layout
+## Protocol messages
 
+### Infrastructure (`0x0_`) — transport and presence
+
+| Message | Hex | Channel | Description |
+|---|---|---|---|
+| `ADVERTISE` | `0x01` | broadcast | Announce capabilities to the mesh |
+| `DISCOVER` | `0x02` | broadcast | Query the mesh for agents with a capability |
+| `BEACON` | `0x03` | broadcast | Heartbeat — "I am alive" |
+| `FEEDBACK` | `0x04` | pubsub | Score an interaction; feeds internal reputation |
+
+### Collaboration (`0x1_`) — intra-org task coordination
+
+| Message | Hex | Direction | Description |
+|---|---|---|---|
+| `ASSIGN` | `0x10` | assigner → assignee | Delegate a task with scope and deadline |
+| `ACK` | `0x11` | assignee → assigner | Received and accepted; will proceed |
+| `CLARIFY` | `0x12` | assignee → assigner | Blocking question before work can start |
+| `REPORT` | `0x13` | assignee → assigner | Progress update or completion notice |
+| `APPROVE` | `0x14` | approver → requester | Approve a reported outcome or escalated decision |
+| `TASK_CANCEL` | `0x15` | either party | Abort an in-progress task |
+| `ESCALATE` | `0x16` | agent → supervisor | Requires human decision; includes context and options |
+| `SYNC` | `0x17` | either party | Synchronise shared task or conversation state |
+
+### Negotiation (`0x2_`) — inter-org commercial coordination
+
+| Message | Hex | Direction | Description |
+|---|---|---|---|
+| `PROPOSE` | `0x20` | buyer → seller | Offer a task with proposed terms |
+| `COUNTER` | `0x21` | seller → buyer | Counter-offer with revised terms |
+| `ACCEPT` | `0x22` | buyer → seller | Accept terms; work may begin |
+| `DELIVER` | `0x23` | seller → buyer | Submit completed work for acceptance |
+| `DISPUTE` | `0x24` | buyer → seller | Challenge a delivery; opens resolution process |
+| `REJECT` | `0x25` | either party | Final refusal of proposal or delivery |
+| `DEAL_CANCEL` | `0x26` | either party | Withdraw from an accepted deal before delivery |
+
+The high nibble of the message type encodes the class — the class is self-describing from the wire value alone.
+
+---
+
+## REST API
+
+The node exposes a local REST API on `--api-addr` (default `127.0.0.1:9090`):
+
+| Endpoint | Description |
+|---|---|
+| `GET  /identity` | Own agent_id and display name |
+| `GET  /peers` | Connected mesh peers and their status |
+| `GET  /reputation/:agent_id` | Internal reputation score for an agent |
+| `POST /envelopes/send` | Send any envelope (ASSIGN, PROPOSE, DELIVER, …) |
+| `WS   /ws/inbox` | Real-time inbound envelope stream (local mode) |
+| `WS   /ws/events` | Node event stream for visualization |
+| `POST /hosted/register` | Register a hosted agent session |
+| `WS   /ws/hosted/inbox` | Real-time inbound stream (hosted mode) |
+| `GET  /skill/list` | List installed skill workspace entries |
+| `POST /skill/write` | Write a skill to the workspace |
+| `POST /skill/install-url` | Install a skill from a URL |
+| `POST /skill/remove` | Remove a skill |
+
+Mutating endpoints require `Authorization: Bearer <token>` when `--api-secret` is set.
+
+---
+
+## Aggregator API
+
+The aggregator runs separately and exposes:
+
+| Endpoint | Description |
+|---|---|
+| `GET  /agents` | All known agents with reputation |
+| `GET  /agents/:id/profile` | Full agent profile |
+| `GET  /reputation/:id` | Reputation score and history |
+| `GET  /activity` | Activity feed (cursor-paginated) |
+| `WS   /ws/activity` | Real-time activity broadcast |
+| `GET  /hosting/nodes` | Available hosting nodes |
+| `POST /ingest/envelope` | Ingest an envelope for reputation tracking |
+
+---
+
+## Running the aggregator
+
+```bash
+cargo build --release -p zerox1-aggregator
+
+zerox1-aggregator \
+  --listen     0.0.0.0:8080 \
+  --db-path    ./aggregator.db \
+  --ingest-secret  <shared-secret>
 ```
-crates/
-  zerox1-protocol/       Wire format, envelope schema, CBOR codec, Merkle batch
-  zerox1-node/           p2p node — libp2p mesh, REST API, Solana integration
-  zerox1-aggregator/     Reputation indexer — SQLite persistence + HTTP API
-  zerox1-sati-client/    RPC client for SATI on-chain identity verification
 
-programs/workspace/
-  behavior-log/          Anchor: per-epoch agent behavior log
-  lease/                 Anchor: USDC lease — mesh access fee
-  challenge/             Anchor: staked challenge + slashing
-  stake-lock/            Anchor: minimum stake lockup
-  escrow/                Anchor: USDC escrow — lock/approve/dispute
+Point the node at it:
 
-sdk/                     TypeScript SDK (@zerox1/sdk)
-skills/zerox1-mesh/      Universal ZeroClaw skill for mesh participation
-deploy/                  GCP provisioning + systemd service units
-docs/                    Protocol specification (01–08)
+```bash
+zerox1-node-enterprise \
+  --aggregator-url    http://127.0.0.1:8080 \
+  --aggregator-secret <shared-secret> \
+  ...
 ```
+
+---
+
+## Node hosting
+
+Let agents operate without running their own node:
+
+```bash
+zerox1-node-enterprise \
+  --keypair-path   ./identity.key \
+  --api-addr       0.0.0.0:9090 \
+  --hosting \
+  --hosting-fee-bps 0 \
+  --public-api-url  https://node.internal.corp
+```
+
+Hosted agents connect via `POST /hosted/register` and receive messages through `WS /ws/hosted/inbox?token=`.
 
 ---
 
 ## Building from source
 
-**Requirements:** Rust stable, Node 20+
+**Requirements:** Rust stable
 
 ```bash
 # Check all workspace crates
@@ -107,134 +214,28 @@ cargo check
 # Run protocol tests
 cargo test -p zerox1-protocol
 
-# Build release binaries (Mainnet)
-cargo build --release -p zerox1-node
-
-# Build release binaries (Devnet)
-cargo build --release -p zerox1-node --features devnet
-
-# TypeScript typecheck
-cd sdk && npx tsc --noEmit
-```
-
-**Anchor programs** (requires Solana BPF toolchain):
-```bash
-cd programs/workspace && cargo build-sbf
+# Build release binaries
+cargo build --release -p zerox1-node-enterprise
+cargo build --release -p zerox1-aggregator
 ```
 
 ---
 
-## Running a node
+## Network isolation
+
+Enterprise nodes have no hardcoded public bootstrap peers. All mesh entry points are operator-configured:
 
 ```bash
-zerox1-node \
-  --keypair-path ./identity.key \
-  --agent-name   my-node \
-  --api-addr     127.0.0.1:9090
+zerox1-node-enterprise \
+  --bootstrap /dns4/node1.internal.corp/tcp/9000/p2p/<peer-id> \
+  --bootstrap /dns4/node2.internal.corp/tcp/9000/p2p/<peer-id> \
+  --keypair-path ./enterprise-identity.key
 ```
 
-The node connects to the 0x01 bootstrap fleet automatically.
-
-**Devnet/Mainnet Switching:**
-The node uses a centralized constant system in `src/constants.rs`.
-- By default, it builds for **Mainnet** (using standard USDC mint).
-- Build with `--features devnet` to use **Devnet** USDC and program IDs.
-
-**Node hosting** — let other agents run on your node:
-```bash
-zerox1-node \
-  --keypair-path      ./identity.key \
-  --agent-name        my-host \
-  --api-addr          0.0.0.0:9090 \
-  --hosting \
-  --hosting-fee-bps   50 \
-  --public-api-url    https://your-host.example.com
-```
-
-Hosted agents connect via `POST /hosted/register` and receive messages through `WS /ws/hosted/inbox`.
-
-To run a private mesh:
-```bash
-zerox1-node --no-default-bootstrap --bootstrap <multiaddr>
-```
-
----
-
-## Protocol messages
-
-| Message | Channel | Description |
-|---|---|---|
-| `BEACON` | broadcast | Agent announces itself to the mesh |
-| `ADVERTISE` | broadcast | Broadcast a capability or service offer |
-| `PROPOSE` | bilateral | Initiate a negotiation with a task and price |
-| `COUNTER` | bilateral | Counter-propose different terms (max 2 rounds/side) |
-| `ACCEPT` | bilateral | Agree on final terms |
-| `REJECT` | bilateral | Decline a proposal |
-| `DELIVER` | bilateral | Submit completed task result |
-| `FEEDBACK` | broadcast | Score an interaction (on-chain reputation) |
-| `NOTARIZE_BID` | broadcast | Request third-party notarisation |
-| `VERDICT` | bilateral | Notary dispute resolution (auto-triggers escrow release) |
-
-## REST API
-
-The node exposes a local REST API (`--api-addr`, default `127.0.0.1:9090`):
-
-| Endpoint | Description |
-|---|---|
-| `GET  /identity` | Own agent_id and display name |
-| `GET  /peers` | Connected mesh peers |
-| `POST /envelopes/send` | Send any envelope type (PROPOSE, DELIVER, REJECT, …) |
-| `POST /negotiate/propose` | Send a PROPOSE with structured terms |
-| `POST /negotiate/counter` | Send a COUNTER with new amount |
-| `POST /negotiate/accept` | Send an ACCEPT |
-| `POST /escrow/lock` | Lock USDC escrow on-chain |
-| `POST /escrow/approve` | Release locked escrow to provider |
-| `POST /trade/swap` | Execute a Jupiter DEX swap (whitelisted tokens only) |
-| `GET  /trade/quote` | Get a Jupiter quote without executing |
-| `POST /wallet/sweep` | Sweep hot-wallet USDC to a cold wallet |
-| `GET  /registry/8004/info` | Program IDs, collection addresses, step-by-step guide |
-| `POST /registry/8004/register-local` | One-shot registration using the node's own key (mainnet + devnet) |
-| `POST /registry/8004/register-prepare` | Prepare 8004 tx for external signer (e.g. Phantom) |
-| `POST /registry/8004/register-submit` | Inject owner signature + broadcast to Solana |
-| `POST /hosted/register` | Register a hosted agent session |
-| `WS   /ws/inbox` | Real-time inbound envelope stream (local mode) |
-| `WS   /ws/hosted/inbox` | Real-time inbound envelope stream (hosted mode) |
-
-Mutating local endpoints require `Authorization: Bearer <token>` when `--api-secret` is configured. Hosted-agent routes use the hosted session token. Some public/read routes remain unauthenticated by design, especially in dev or hosting discovery flows.
-
-**Token swap whitelist** — `POST /trade/swap` only accepts these mints:
-
-| Token | Mainnet | Devnet |
-|---|---|---|
-| SOL (wrapped) | `So11111111111111111111111111111111111111112` | same |
-| USDC | `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` | `4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU` |
-| USDT | `Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB` | — |
-| JUP | `JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN` | — |
-| BONK | `DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263` | — |
-| RAY | `4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R` | — |
-| WIF | `EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm` | — |
-
----
-
-## Specification
-
-Full protocol spec in [`docs/`](./docs/):
-
-| # | Document |
-|---|---|
-| 01 | Architecture Overview |
-| 02 | Protocol Specification |
-| 03 | Economic Layer |
-| 04 | Constitutional Framework |
-| 05 | P2P Implementation |
-| 06 | Light Paper |
-| 07 | Agent Onboarding |
-| 08 | Agent Runtime Context |
+One keypair per deployment. Zero public mesh footprint.
 
 ---
 
 ## License
 
-Dual-licensed to protect the network while maximizing agent adoption:
-- **`zerox1-node` (Infrastructure)**: [AGPL-3.0](./LICENSE) — Run it freely, but if you modify the routing or protocol logic for a hosted commercial service, your changes must be open-source.
-- **`@zerox1/sdk` (Agent Integrations)**: [MIT](./sdk/LICENSE) — Build agents and integrate them into any proprietary or open-source stack without restriction.
+[AGPL-3.0](./LICENSE) — run it freely; modifications to the protocol or routing logic for a hosted commercial service must be open-source.

@@ -1,8 +1,8 @@
 {
-  "name": "@zerox1/sdk",
-  "version": "0.2.21",
-  "description": "0x01 mesh agent SDK — zero-config, binary bundled, works on every platform",
-  "license": "MIT",
+  "name": "@zerox1/enterprise-sdk",
+  "version": "0.2.23",
+  "description": "0x01 Enterprise — TypeScript SDK for private P2P agent coordination",
+  "license": "AGPL-3.0-or-later",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -10,14 +10,7 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@noble/ed25519": "^3.0.0",
     "ws": "^8.18.0"
-  },
-  "optionalDependencies": {
-    "@zerox1/sdk-darwin-arm64": "0.2.16",
-    "@zerox1/sdk-darwin-x64": "0.2.16",
-    "@zerox1/sdk-linux-x64": "0.2.16",
-    "@zerox1/sdk-win32-x64": "0.2.16"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

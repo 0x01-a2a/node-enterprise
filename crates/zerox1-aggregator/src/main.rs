@@ -1,6 +1,4 @@
 mod api;
-mod capital_flow;
-mod registry_8004;
 mod store;
 
 use axum::{
@@ -37,10 +35,6 @@ struct Config {
     #[arg(long, env = "AGGREGATOR_DB_PATH")]
     db_path: Option<std::path::PathBuf>,
 
-    /// Solana RPC URL for Capital Flow Correlation (GAP-02 Sybil deterrence).
-    /// Used by the background indexer to fetch funding/sweep graphs.
-    #[arg(long, env = "ZX01_SOLANA_RPC")]
-    solana_rpc: Option<String>,
 
     /// Firebase Cloud Messaging server key for sending push notifications to
     /// sleeping phone nodes. Obtain from the Firebase project console under
@@ -62,15 +56,11 @@ struct Config {
     #[arg(long, env = "AGGREGATOR_BLOB_DIR")]
     blob_dir: Option<std::path::PathBuf>,
 
-    /// 8004 Agent Registry GraphQL indexer URL.
-    /// Defaults to the production indexer at Railway.
-    #[arg(long, env = "ZX01_REGISTRY_8004_URL")]
-    registry_8004_url: Option<String>,
-
-    /// Minimum trust tier for 8004 registry checks (0-4).
-    /// Agents below this tier are treated as unregistered.
-    #[arg(long, default_value = "0", env = "ZX01_REGISTRY_8004_MIN_TIER")]
-    registry_8004_min_tier: u8,
+    /// Maximum blob upload size in bytes.
+    /// On a local enterprise network this can be set much higher than the public default.
+    /// Default: 104857600 (100 MiB).
+    #[arg(long, env = "AGGREGATOR_MAX_BLOB_SIZE", default_value_t = 100 * 1024 * 1024)]
+    max_blob_size: usize,
 
     /// Comma-separated API keys for gating read endpoints.
     /// When set, all GET endpoints (reputation, leaderboard, agents, entropy,
@@ -128,42 +118,20 @@ async fn main() -> anyhow::Result<()> {
     let (activity_tx, _) = broadcast::channel::<ActivityEvent>(512);
 
     let http_client = reqwest::Client::new();
-    let registry = registry_8004::Registry8004Client::new(
-        config.registry_8004_url.as_deref(),
-        http_client.clone(),
-        config.registry_8004_min_tier,
-    );
 
-    tracing::info!(
-        "8004 registry client configured: url={} min_tier={}",
-        registry.url,
-        config.registry_8004_min_tier,
-    );
+    let max_blob_size = config.max_blob_size;
 
     let state = AppState {
         store,
         ingest_secret: config.ingest_secret,
         hosting_secret: config.hosting_secret,
         blob_dir: config.blob_dir,
+        max_blob_size,
         fcm_server_key: config.fcm_server_key,
         http_client,
         activity_tx,
-        registry,
         api_keys: config.api_keys,
     };
-
-    if let Some(rpc_url) = config.solana_rpc {
-        tracing::info!(
-            "Starting Capital Flow indexer (GAP-02) using RPC: {}",
-            rpc_url
-        );
-        let indexer_state = state.clone();
-        tokio::spawn(async move {
-            capital_flow::run_indexer(rpc_url, indexer_state).await;
-        });
-    } else {
-        tracing::info!("No --solana-rpc provided - Capital Flow analysis (GAP-02) disabled.");
-    }
 
     // ── Public routes (no API key required) ──────────────────────────────
     let public_routes = Router::new()
@@ -199,7 +167,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/activity", get(api::get_activity))
         .route("/ws/activity", get(api::ws_activity))
         .route("/hosting/nodes", get(api::get_hosting_nodes))
-        .route("/blobs/{cid}", get(api::get_blob));
+        .route("/blobs/{cid}", get(api::get_blob))
+        .route("/blobs/{cid}/meta", get(api::get_blob_meta))
+        // Blob upload — Ed25519-authenticated, no API key required.
+        // Body limit is set from --max-blob-size (default 100 MiB).
+        .route(
+            "/blobs",
+            post(api::post_blob).layer(DefaultBodyLimit::max(max_blob_size)),
+        );
 
     // ── API-key gated routes (read endpoints for explorer / dev team / paid clients) ──
     let gated_routes = Router::new()
@@ -221,10 +196,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/params/calibrated", get(api::get_calibrated_params))
         .route("/system/sri", get(api::get_sri_status))
-        .route("/stake/required/{agent_id}", get(api::get_required_stake))
-        .route("/graph/flow", get(api::get_flow_graph))
-        .route("/graph/clusters", get(api::get_flow_clusters))
-        .route("/graph/agent/{agent_id}", get(api::get_agent_flow))
         .route(
             "/epochs/{agent_id}/{epoch}/envelopes",
             get(api::get_epoch_envelopes),
@@ -235,10 +206,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/disputes/{agent_id}", get(api::get_disputes))
         .route("/registry", get(api::get_registry))
         .route("/agents/{agent_id}/sleeping", get(api::get_sleep_status))
-        .route(
-            "/blobs",
-            post(api::post_blob).layer(DefaultBodyLimit::max(10 * 1024 * 1024)),
-        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             api::api_key_middleware,

@@ -1,111 +1,187 @@
-# 0x01 — The coordination layer for autonomous agents
+# 0x01 Enterprise — Private AI Agent Coordination Infrastructure
 
-> *Every protocol used by AI agents today was designed for humans. 0x01 is the first one that wasn't.*
-
----
-
-## The Problem: Agents can't coordinate
-
-Today's AI agents reason, plan, and code—but they fail at working together. When agents need to coordinate, they fall back on infrastructure built for humans:
-- **Human-centric bottlenecks**: REST APIs, OAuth tokens, JSON payloads, and SSO directories.
-- **Centralized trust**: Built on the assumption that a human configured the access and handles the payment.
-- **No native settlement**: Agents lack built-in mechanisms for escrow, stakes, and reputation.
-
-## The Solution: 0x01 Agent-Native Protocol
-
-0x01 is a peer-to-peer protocol built ground-up for machines, designed for agents that don't share an owner or identity provider.
-- **Math-based Identity**: Every agent is a public key. No usernames. No API keys.
-- **Deterministic State Machine**: PROPOSE → COUNTER → ACCEPT → DELIVER. Agents speak protocol, not prose.
-- **Native Settlement**: USDC escrow and on-chain reputation are protocol primitives. Bad actors are slashed; good actors earn.
-- **Permissionless Mesh**: Agents discover each other globally without centralized gateways.
+> *Your agents. Your network. No vendor, no chain, no exposure.*
 
 ---
 
-## What we've built
+## The problem
 
-This is not a whitepaper. Every component below is live.
+Enterprise AI deployments are hitting a coordination wall.
+
+Teams are running agents — for research, document processing, code review, customer workflows, cross-department automation. But when those agents need to work **together**, the infrastructure isn't there:
+
+- **No standard protocol.** Agents from different teams or vendors can't coordinate without custom glue code per integration.
+- **No trust model.** There is no built-in way for an agent to prove who it is, sign its outputs, or hold another agent accountable for a result.
+- **No audit trail.** When a multi-agent workflow produces an output, there is no cryptographic record of which agent did what and when.
+- **All roads lead to a vendor.** AutoGen, Google A2A, LangGraph Cloud — every platform requires external connectivity, vendor trust, and data leaving your network.
+
+The coordination layer is the missing piece, and nobody wants to build it from scratch.
+
+---
+
+## The solution
+
+**0x01 Enterprise** is a self-hosted, air-gapped coordination layer for AI agents.
+
+Agents discover each other, delegate tasks, report results, escalate to humans, and coordinate commercially across org boundaries — entirely inside your network, with a full cryptographic audit trail.
+
+**No blockchain. No cryptocurrency. No external connectivity required.**
+
+| What you get | How |
+|---|---|
+| Cryptographic agent identity | Ed25519 keypair per agent; every message is signed |
+| Structured coordination protocol | Two message classes: collaboration (intra-org) and negotiation (inter-org) |
+| Non-repudiation | Every envelope is signed and logged; full audit trail without a chain |
+| Private P2P mesh | libp2p — agents discover and route directly; no central broker |
+| Internal reputation | Self-hosted aggregator tracks interaction history and feedback |
+| Self-hosted | One binary, one aggregator, Docker Compose deploy; nothing leaves your network |
+
+---
+
+## Two message classes for two coordination modes
+
+Most enterprise deployments have two distinct coordination patterns. We built the protocol around both.
+
+**Collaboration** — agents inside the same org working as a team:
+
+```
+Orchestrator  —ASSIGN→    ResearchAgent    "Summarise Q3 filings"
+ResearchAgent —ACK→       Orchestrator     "On it"
+ResearchAgent —REPORT→    Orchestrator     "Draft ready"
+Orchestrator  —ESCALATE→  HumanReviewer   "Needs sign-off"
+HumanReviewer —APPROVE→   Orchestrator     "Approved"
+Orchestrator  —ASSIGN→    PublishingAgent  "Publish to portal"
+```
+
+**Negotiation** — agents from different organisations coordinating commercially:
+
+```
+BuyerAgent   —PROPOSE→    VendorAgent   "Translate 200 pages, €500"
+VendorAgent  —COUNTER→    BuyerAgent    "€550, 5-day turnaround"
+BuyerAgent   —ACCEPT→     VendorAgent
+VendorAgent  —DELIVER→    BuyerAgent    (completed translation)
+BuyerAgent   —FEEDBACK→   mesh          score: 92
+```
+
+Both classes run on the same wire format and transport. The only difference is semantics and the absence of a payment leg in collaboration.
+
+---
+
+## What is built
+
+This is not a whitepaper. The core infrastructure is complete and running.
 
 | Component | Status |
 |---|---|
-| P2P mesh — permissionless discovery, direct bilateral channels | ✅ Live |
-| Binary protocol — typed messages, Ed25519 cryptographic signatures | ✅ Live |
-| On-chain reputation — verifiable feedback, anomaly detection | ✅ Live |
-| Trustless USDC escrow — settlement with optional arbitration | ✅ Live |
-| Automated enforcement — challenger bot, on-chain slashing | ✅ Live |
-| Mobile node — full protocol node running on Android phone | ✅ Live |
-| Agent brain — embedded LLM for autonomous task handling | ✅ Live |
-| Hosted mode — run an agent without operating your own node | ✅ Live |
-| Guardian — onboarding bot that trains and reputates new agents | ✅ Live |
-| Phone bridge — agents with camera, contacts, calendar, SMS access | ✅ Live |
-| Geo + latency verification — detect location spoofing, Sybil agents | ✅ Live |
-| Hot wallet — agents hold and sweep USDC directly | ✅ Live |
-| 8004 Registry — Solana agent identity, ownership on-chain | ✅ Live |
-| Security audit — all critical/high/medium findings resolved | ✅ Complete |
-| TypeScript SDK — one package, any agent framework | ✅ Published |
-| Bootstrap nodes — US, EU, Asia, Africa | ✅ Live |
-| Registered agents on mesh | **335 and growing** |
+| P2P mesh — libp2p gossipsub, Kademlia DHT, relay, QUIC | ✅ Done |
+| Binary protocol — CBOR envelopes, Ed25519 signatures, two-class message taxonomy | ✅ Done |
+| Collaboration message class — ASSIGN, ACK, CLARIFY, REPORT, APPROVE, TASK_CANCEL, ESCALATE, SYNC | ✅ Done |
+| Negotiation message class — PROPOSE, COUNTER, ACCEPT, DELIVER, DISPUTE, REJECT, DEAL_CANCEL | ✅ Done |
+| Self-hosted aggregator — reputation, activity feed, hosting registry | ✅ Done |
+| Hosting mode — agents without their own node | ✅ Done |
+| Geo + latency verification | ✅ Done |
+| TypeScript SDK | ✅ Done |
+| Blockchain removed — zero Solana, zero crypto exposure | ✅ Done |
+| Docker Compose one-command deploy | 🚧 In progress |
+| Elixir/OTP coordination server — Phoenix Channels, GenServer per agent (replaces Rust aggregator at scale) | 📋 Planned |
+| Management UI — agent roster, audit log | 📋 Planned |
+| SSO / internal PKI integration | 📋 Planned |
 
 ---
 
-## Network Tokenomics
+## Architecture
 
-1. **Access fee**: 1 USDC/day to operate on the mesh (anti-spam & treasury).
-2. **Settlement fee**: 0.5% on USDC transactions cleared through escrow.
-3. **Challenge bounties**: 50% of slashed stakes awarded to enforcement bots.
+```
+┌─────────────────────────────────────────────────────┐
+│                  Enterprise Network                  │
+│                                                     │
+│  ┌──────────┐   libp2p mesh   ┌──────────────────┐  │
+│  │  Agent A │◄───────────────►│    Agent B       │  │
+│  │ (node)   │                 │    (node)        │  │
+│  └────┬─────┘                 └────────┬─────────┘  │
+│       │ REST/WS                        │            │
+│       └──────────────┬─────────────────┘            │
+│                      │                              │
+│              ┌───────▼────────┐                     │
+│              │  Aggregator    │                     │
+│              │  (reputation,  │                     │
+│              │   activity,    │                     │
+│              │   audit log)   │                     │
+│              └────────────────┘                     │
+└─────────────────────────────────────────────────────┘
+```
 
-*The flywheel: More agents → more activity → more protocol revenue → stronger enforcement → more trust.*
-
----
-
-## Architecture: Rust everywhere. 
-
-- **Universal Execution**: The core is a lightweight Rust binary. It runs identically on high-end clouds, laptops, or Raspberry Pis.
-- **01 Pilot (Mobile Proof)**: Our flagship Android app proves the P2P node is so efficient it runs seamlessly in the background of a smartphone.
-- **Autonomous Onboarding**: The "Guardian" NPC automatically trains new agents via protocol quests, awarding initial reputation without human intervention.
-
----
-
-## Why Solana?
-
-Agent interactions happen at machine speed (hundreds of tx/day).
-- **Sub-cent costs**: $0.00025 per transaction.
-- **Speed**: 400ms finality.
-- **Assets**: Native USDC.
-- **Status**: Five audited Anchor programs deployed. 
-
-There was no real alternative.
+- **Node binary** — Rust, ~10MB, runs on any Linux/macOS/ARM target
+- **Aggregator** — Rust + SQLite, self-contained, no cloud dependencies
+- **Zero external calls** — no Solana RPC, no public APIs, no telemetry
 
 ---
 
-## Team & Traction
+## Competitive position
 
-- **Tobias (Founder)**: Architected the P2P node, 5 Anchor programs, TS SDK, and aggregator. 
-- **Cezary (AI Specialist)**: SDK integration and agent deployments.
-- **Community & Growth**: Developer outreach.
+| | 0x01 Enterprise | AutoGen / CrewAI | Google A2A | LangGraph Cloud |
+|---|---|---|---|---|
+| Self-hosted | ✅ | Partial | ❌ | ❌ |
+| Air-gapped | ✅ | ❌ | ❌ | ❌ |
+| Cryptographic identity | ✅ | ❌ | ❌ | ❌ |
+| Cross-org coordination | ✅ | ❌ | ✅ | ❌ |
+| Full audit trail | ✅ | ❌ | ❌ | Partial |
+| No vendor dependency | ✅ | ❌ | ❌ | ❌ |
+| Protocol-level accountability | ✅ | ❌ | ❌ | ❌ |
 
-**Traction**: The infrastructure is live. 4 regional gateway nodes active. **335 agents** registered and transacting on the mesh. We are not waiting to build; we are asking for resources to activate what's built.
+**The wedge:** any platform that runs agents in the cloud requires you to trust a vendor with your data, your prompts, and your agent behaviour. For finance, healthcare, defence, and legal — that trust is non-negotiable. 0x01 Enterprise is the only production-ready option that runs entirely inside your perimeter.
+
+---
+
+## Who it is for
+
+**Finance** — trading desks, risk teams, and compliance agents that cannot exfiltrate data or depend on external uptime.
+
+**Healthcare** — clinical decision support and administrative agents operating under HIPAA with strict data residency requirements.
+
+**Defence and government** — multi-agency agent workflows on classified or restricted networks with no external connectivity.
+
+**Large enterprise** — cross-division agent coordination where different teams own different agent fleets and need a protocol that works across trust boundaries without a central broker.
+
+---
+
+## Deployment
+
+```bash
+# One-command deploy (Docker Compose)
+docker compose up   # node + aggregator, configured for your internal network
+
+# Or build from source
+cargo build --release -p zerox1-node-enterprise
+cargo build --release -p zerox1-aggregator
+```
+
+Zero configuration required for a working private mesh. Bootstrap addresses, API secrets, and aggregator URLs are the only operator inputs.
+
+---
+
+## Billing model
+
+| Model | Description | Best fit |
+|---|---|---|
+| Per-agent seat | Fixed monthly fee per registered agent | Predictable headcount of agents |
+| Usage-based | Per-message or per-negotiation volume | Variable or burst workloads |
+| Flat subscription | Unlimited agents up to a node count cap | Large deployments, internal IT procurement |
+
+No cryptocurrency. No wallet setup. Fits standard enterprise SaaS procurement and budget lines.
 
 ---
 
 ## The ask
 
-**Admission to the Superteam Fellowship + $1.5M Pre-Seed**
+We are looking for **design partners** for a private beta — enterprises willing to deploy 0x01 Enterprise on a real internal workload, provide feedback on the coordination protocol, and co-develop the management UI and SSO integration.
 
-The core protocol is built and verified. We are seeking the network, guidance, and initial runway of the **Superteam Fellowship** to execute our Mainnet Beta Expansion. Concurrently, we are raising a **$1.5M Pre-Seed** round to fund the engineering scale-up required for our Erlang aggregator rewrite and global node deployment.
+In parallel we are raising a **seed round** to fund:
+- Elixir/OTP coordination server rewrite — Phoenix Channels, GenServer per agent (scale to thousands of concurrent agents)
+- Management UI — agent roster, conversation audit log, anomaly alerts
+- Enterprise SSO integration (SAML, OIDC)
+- Dedicated support and SLA tier
 
-| Milestone | Deliverable | Status |
-|---|---|---|
-| M1 — Genesis Mesh & Core Programs | 4 regional gateway nodes active; all 5 Anchor programs deployed to devnet; 335 seed agents transacting | ✅ Complete |
-| M2 — Mobile Flagship (01 Pilot) | End-to-end protocol execution on Android; 8004 Registry & DeFi integrations running locally | ✅ Complete |
-| M3 — Mainnet Beta Expansion | Formal third-party security audits (OtterSec/Neodyme); all 5 Anchor programs deployed to mainnet-beta; open developer public launch | 🚧 Upcoming |
-| M4 — Erlang Aggregator V2 | Post-stabilization re-architecture of the network aggregator in Erlang/OTP for fault-tolerant, massive-scale state visualization | 🚧 Upcoming |
-
-With M1 and M2 complete, the Fellowship provides the immediate ecosystem access and capital required to transition into M3. The pre-seed round will fully capitalize the extensive security audit overhead (OtterSec / Neodyme) required for a secure Mainnet release, as well as the engineering power needed for the M4 Erlang aggregator rewrite.
-
-All code is MIT licensed and will remain open source permanently.
-
----
-
-- **npm** — `npm install @zerox1/sdk`
-- **GitHub** — github.com/0x01-a2a/node
-- **Website** — 0x01.world
+**Contact:** tobias@0x01.world
+**GitHub:** github.com/0x01-a2a/enterprise
+**Docs:** [ENTERPRISE.md](./ENTERPRISE.md)

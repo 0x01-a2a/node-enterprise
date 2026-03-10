@@ -97,15 +97,19 @@ pub struct FeedbackEvent {
     pub raw_b64: Option<String>,
 }
 
+/// Generic envelope event for collaboration and negotiation messages.
+/// Covers ASSIGN, ACK, CLARIFY, REPORT, APPROVE, TASK_CANCEL, ESCALATE, SYNC,
+/// COUNTER, ACCEPT.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerdictEvent {
+pub struct EnvelopeEvent {
     pub sender: String,
     pub recipient: String,
     pub conversation_id: String,
     pub slot: u64,
 }
 
-/// Entropy vector pushed by a node at epoch boundary.
+/// Entropy vector — kept for dead-code SQLite methods (upsert_entropy, query_entropy_latest, etc.).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntropyEvent {
     pub agent_id: String,
@@ -121,20 +125,12 @@ pub struct EntropyEvent {
     pub n_hv: u32,
 }
 
+/// Notarize bid — kept for dead-code SQLite method (insert_notarize_bid).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotarizeBidEvent {
     pub sender: String,
     pub conversation_id: String,
-    pub slot: u64,
-}
-
-/// Latency measurement pushed by a reference node (--node-region).
-/// agent_id is the measured peer; region identifies the reference point.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LatencyEvent {
-    pub agent_id: String,
-    pub region: String,
-    pub rtt_ms: u64,
     pub slot: u64,
 }
 
@@ -236,7 +232,6 @@ pub struct AgentProfile {
     pub agent_id: String,
     pub name: Option<String>,
     pub reputation: Option<AgentReputation>,
-    pub entropy: Option<EntropyEvent>,
     pub capabilities: Vec<CapabilityMatch>,
     pub disputes: Vec<DisputeRecord>,
     pub last_seen: Option<u64>,
@@ -260,26 +255,45 @@ pub struct ActivityEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg_type")]
 pub enum IngestEvent {
+    // Infrastructure
     #[serde(rename = "FEEDBACK")]
     Feedback(FeedbackEvent),
-    #[serde(rename = "VERDICT")]
-    Verdict(VerdictEvent),
-    #[serde(rename = "ENTROPY")]
-    Entropy(EntropyEvent),
-    #[serde(rename = "NOTARIZE_BID")]
-    NotarizeBid(NotarizeBidEvent),
     #[serde(rename = "ADVERTISE")]
     Advertise(AdvertiseEvent),
-    #[serde(rename = "DISPUTE")]
-    Dispute(DisputeEvent),
     #[serde(rename = "BEACON")]
     Beacon(BeaconEvent),
-    #[serde(rename = "LATENCY")]
-    Latency(LatencyEvent),
-    #[serde(rename = "REJECT")]
-    Reject(RejectEvent),
+    // Collaboration (0x1_)
+    #[serde(rename = "ASSIGN")]
+    Assign(EnvelopeEvent),
+    #[serde(rename = "ACK")]
+    Ack(EnvelopeEvent),
+    #[serde(rename = "CLARIFY")]
+    Clarify(EnvelopeEvent),
+    #[serde(rename = "REPORT")]
+    Report(EnvelopeEvent),
+    #[serde(rename = "APPROVE")]
+    Approve(EnvelopeEvent),
+    #[serde(rename = "TASK_CANCEL")]
+    TaskCancel(EnvelopeEvent),
+    #[serde(rename = "ESCALATE")]
+    Escalate(EnvelopeEvent),
+    #[serde(rename = "SYNC")]
+    Sync(EnvelopeEvent),
+    // Negotiation (0x2_)
+    #[serde(rename = "PROPOSE")]
+    Propose(EnvelopeEvent),
+    #[serde(rename = "COUNTER")]
+    Counter(EnvelopeEvent),
+    #[serde(rename = "ACCEPT")]
+    Accept(EnvelopeEvent),
     #[serde(rename = "DELIVER")]
     Deliver(DeliverEvent),
+    #[serde(rename = "DISPUTE")]
+    Dispute(DisputeEvent),
+    #[serde(rename = "REJECT")]
+    Reject(RejectEvent),
+    #[serde(rename = "DEAL_CANCEL")]
+    DealCancel(EnvelopeEvent),
 }
 
 // ============================================================================
@@ -294,7 +308,6 @@ pub struct AgentReputation {
     pub positive_count: u64,
     pub neutral_count: u64,
     pub negative_count: u64,
-    pub verdict_count: u64,
     pub average_score: f64,
     pub last_updated: u64,
     /// Computed on read from DB; not stored. "rising" | "falling" | "stable".
@@ -410,7 +423,6 @@ impl AgentReputation {
             positive_count: 0,
             neutral_count: 0,
             negative_count: 0,
-            verdict_count: 0,
             average_score: 0.0,
             last_updated: now_secs(),
             trend: default_trend(),
@@ -438,10 +450,6 @@ impl AgentReputation {
         self.last_updated = now_secs();
     }
 
-    fn apply_verdict(&mut self) {
-        self.verdict_count += 1;
-        self.last_updated = now_secs();
-    }
 }
 
 // ============================================================================
@@ -529,199 +537,12 @@ pub struct SriStatus {
     pub computed_at: u64,
 }
 
-/// Per-agent required stake — GET /stake/required/{id}
-#[derive(Debug, Clone, Serialize)]
-pub struct RequiredStakeResult {
-    pub agent_id: String,
-    pub base_stake_usdc: f64,
-    pub current_anomaly: f64,
-    pub c_coefficient: f64, // ownership clustering score (0-1)
-    pub beta_1: f64,
-    pub beta_3: f64,
-    pub required_stake_usdc: f64, // base * (1 + β₁·A + β₃·C)
-    pub deficit_usdc: f64,        // max(0, required - base)
-}
-
-// ============================================================================
-// Capital flow graph types (GAP-02)
-// ============================================================================
-
-/// One directed edge in the capital flow graph.
-///
-/// `positive_flow` = sum of positive scores flowing from → to over the window.
-/// High mutual positive_flow between two agents signals score inflation.
-#[derive(Debug, Clone, Serialize)]
-pub struct CapitalFlowEdge {
-    pub from_agent: String,
-    pub to_agent: String,
-    pub interaction_count: u32,
-    pub positive_flow: i64,
-    pub total_abs_flow: i64,
-    pub avg_score: f64,
-}
-
-/// A cluster of suspected same-owner agents detected via mutual flow analysis.
-#[derive(Debug, Clone, Serialize)]
-pub struct FlowCluster {
-    pub cluster_id: u32,
-    pub agents: Vec<String>,
-    /// 0-1: (cluster_size - 1) / 10, capped at 1.0.
-    pub cluster_suspicion: f64,
-    /// C coefficient fed into the stake multiplier formula.
-    pub c_coefficient: f64,
-    pub total_mutual_flow: i64,
-}
-
-/// Graph position and C coefficient for one agent.
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentFlowInfo {
-    pub agent_id: String,
-    pub cluster_id: Option<u32>,
-    pub c_coefficient: f64,
-    /// Fraction of total outgoing positive flow directed at the top-3 counterparties.
-    /// > 0.70 is suspicious for large networks.
-    pub concentration_ratio: f64,
-    pub top_counterparties: Vec<String>,
-    pub total_outgoing_flow: i64,
-    pub unique_counterparties: u32,
-}
-
 /// One ordered CBOR envelope entry — used by GET /epochs/{agent_id}/{epoch}/envelopes.
 #[derive(Debug, Clone, Serialize)]
 pub struct EpochEnvelopeEntry {
     pub seq: i64,
     pub leaf_hash: String,
     pub bytes_b64: String,
-}
-
-// ============================================================================
-// Union-Find for clustering
-// ============================================================================
-
-struct UnionFind {
-    parent: HashMap<String, String>,
-}
-
-impl UnionFind {
-    fn new() -> Self {
-        Self {
-            parent: HashMap::new(),
-        }
-    }
-
-    fn find(&mut self, x: &str) -> String {
-        if !self.parent.contains_key(x) {
-            self.parent.insert(x.to_string(), x.to_string());
-            return x.to_string();
-        }
-        // Iterative path compression.
-        let mut root = x.to_string();
-        while self.parent[&root] != root {
-            root = self.parent[&root].clone();
-        }
-        let mut cur = x.to_string();
-        while self.parent[&cur] != root {
-            let next = self.parent[&cur].clone();
-            self.parent.insert(cur, root.clone());
-            cur = next;
-        }
-        root
-    }
-
-    fn union(&mut self, a: &str, b: &str) {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra != rb {
-            self.parent.insert(rb, ra);
-        }
-    }
-}
-
-/// Build ownership clusters from capital flow edges.
-///
-/// Two agents are linked when they have mutual positive feedback with
-/// mutual_ratio > 0.5 (i.e. both sides are giving nearly equal scores,
-/// suggesting coordinated score inflation).
-fn compute_clusters_from_edges(
-    edges: &[CapitalFlowEdge],
-) -> (HashMap<String, u32>, Vec<FlowCluster>) {
-    // Index edge weights for O(1) reverse lookup.
-    let mut flow_map: HashMap<(&str, &str), i64> = HashMap::new();
-    for e in edges {
-        flow_map.insert((&e.from_agent, &e.to_agent), e.positive_flow);
-    }
-
-    let mut uf = UnionFind::new();
-    // Canonically-keyed mutual flow totals to avoid double-counting.
-    let mut mutual_cache: HashMap<(String, String), i64> = HashMap::new();
-
-    for e in edges {
-        if e.positive_flow <= 0 {
-            continue;
-        }
-        let rev = flow_map
-            .get(&(e.to_agent.as_str(), e.from_agent.as_str()))
-            .copied()
-            .unwrap_or(0);
-        if rev <= 0 {
-            continue;
-        }
-
-        let lo = e.positive_flow.min(rev);
-        let hi = e.positive_flow.max(rev);
-        if lo as f64 / hi as f64 > 0.5 {
-            uf.union(&e.from_agent, &e.to_agent);
-            // Store under canonical (alphabetically smaller) key.
-            let (ka, kb) = if e.from_agent <= e.to_agent {
-                (e.from_agent.clone(), e.to_agent.clone())
-            } else {
-                (e.to_agent.clone(), e.from_agent.clone())
-            };
-            mutual_cache.entry((ka, kb)).or_insert(lo + hi);
-        }
-    }
-
-    // Collect all nodes that appeared in any edge.
-    let all_nodes: std::collections::HashSet<&str> = edges
-        .iter()
-        .flat_map(|e| [e.from_agent.as_str(), e.to_agent.as_str()])
-        .collect();
-
-    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
-    for &node in &all_nodes {
-        let root = uf.find(node);
-        groups.entry(root).or_default().push(node.to_string());
-    }
-
-    let mut agent_cluster: HashMap<String, u32> = HashMap::new();
-    let mut clusters: Vec<FlowCluster> = vec![];
-
-    for (cid, mut members) in groups.into_values().filter(|v| v.len() >= 2).enumerate() {
-        let cid = cid as u32;
-        members.sort(); // deterministic ordering
-        let member_set: std::collections::HashSet<&str> =
-            members.iter().map(|s| s.as_str()).collect();
-        let total_flow: i64 = mutual_cache
-            .iter()
-            .filter(|((a, b), _)| {
-                member_set.contains(a.as_str()) && member_set.contains(b.as_str())
-            })
-            .map(|(_, &v)| v)
-            .sum();
-        let suspicion = ((members.len() - 1) as f64 / 10.0).min(1.0);
-        for m in &members {
-            agent_cluster.insert(m.clone(), cid);
-        }
-        clusters.push(FlowCluster {
-            cluster_id: cid,
-            agents: members,
-            cluster_suspicion: suspicion,
-            c_coefficient: suspicion,
-            total_mutual_flow: total_flow,
-        });
-    }
-
-    (agent_cluster, clusters)
 }
 
 // ============================================================================
@@ -958,7 +779,7 @@ impl Db {
         let mut stmt = self.0.prepare(
             "SELECT agent_id, feedback_count, total_score,
                     positive_count, neutral_count, negative_count,
-                    verdict_count, last_updated
+                    last_updated
              FROM agent_reputation",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -968,8 +789,7 @@ impl Db {
             let positive_count: u64 = row.get::<_, i64>(3)? as u64;
             let neutral_count: u64 = row.get::<_, i64>(4)? as u64;
             let negative_count: u64 = row.get::<_, i64>(5)? as u64;
-            let verdict_count: u64 = row.get::<_, i64>(6)? as u64;
-            let last_updated: u64 = row.get::<_, i64>(7)? as u64;
+            let last_updated: u64 = row.get::<_, i64>(6)? as u64;
             let average_score = if feedback_count > 0 {
                 total_score as f64 / feedback_count as f64
             } else {
@@ -982,7 +802,6 @@ impl Db {
                 positive_count,
                 neutral_count,
                 negative_count,
-                verdict_count,
                 average_score,
                 last_updated,
                 trend: default_trend(),
@@ -1008,15 +827,14 @@ impl Db {
         self.0.execute(
             "INSERT INTO agent_reputation
                  (agent_id, feedback_count, total_score, positive_count,
-                  neutral_count, negative_count, verdict_count, last_updated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                  neutral_count, negative_count, last_updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(agent_id) DO UPDATE SET
                  feedback_count = excluded.feedback_count,
                  total_score    = excluded.total_score,
                  positive_count = excluded.positive_count,
                  neutral_count  = excluded.neutral_count,
                  negative_count = excluded.negative_count,
-                 verdict_count  = excluded.verdict_count,
                  last_updated   = excluded.last_updated",
             rusqlite::params![
                 rep.agent_id,
@@ -1025,7 +843,6 @@ impl Db {
                 rep.positive_count as i64,
                 rep.neutral_count as i64,
                 rep.negative_count as i64,
-                rep.verdict_count as i64,
                 rep.last_updated as i64,
             ],
         )?;
@@ -1479,79 +1296,6 @@ impl Db {
         })
     }
 
-    /// Latest anomaly score for required_stake computation.
-    fn query_latest_anomaly(&self, agent_id: &str) -> rusqlite::Result<Option<f64>> {
-        let mut stmt = self.0.prepare(
-            "SELECT anomaly FROM entropy_vectors
-             WHERE agent_id = ?1
-             ORDER BY epoch DESC
-             LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(rusqlite::params![agent_id], |r| r.get::<_, f64>(0))?;
-        rows.next().transpose()
-    }
-
-    /// Capital flow edges: directed positive-feedback graph over a time window.
-    ///
-    /// Only pairs with ≥ 2 interactions are returned to reduce noise.
-    fn query_capital_flow_edges(
-        &self,
-        since: u64,
-        limit: usize,
-    ) -> rusqlite::Result<Vec<CapitalFlowEdge>> {
-        let mut stmt = self.0.prepare(
-            "SELECT sender,
-                    target_agent,
-                    COUNT(*)                                                  AS interaction_count,
-                    SUM(CASE WHEN score > 0 THEN score ELSE 0 END)            AS positive_flow,
-                    SUM(ABS(score))                                           AS total_abs_flow,
-                    CAST(AVG(score) AS REAL)                                  AS avg_score
-             FROM feedback_events
-             WHERE ts >= ?1
-             GROUP BY sender, target_agent
-             HAVING COUNT(*) >= 2
-             ORDER BY positive_flow DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![since as i64, limit as i64], |row| {
-            Ok(CapitalFlowEdge {
-                from_agent: row.get(0)?,
-                to_agent: row.get(1)?,
-                interaction_count: row.get::<_, i64>(2)? as u32,
-                positive_flow: row.get::<_, i64>(3)?,
-                total_abs_flow: row.get::<_, i64>(4)?,
-                avg_score: row.get::<_, f64>(5)?,
-            })
-        })?;
-        rows.collect()
-    }
-
-    /// Per-agent outgoing flow summary — top counterparties by positive flow.
-    fn query_agent_outgoing(
-        &self,
-        agent_id: &str,
-        since: u64,
-    ) -> rusqlite::Result<Vec<(String, u32, i64)>> {
-        let mut stmt = self.0.prepare(
-            "SELECT target_agent,
-                    COUNT(*)                                       AS cnt,
-                    SUM(CASE WHEN score > 0 THEN score ELSE 0 END) AS positive_flow
-             FROM feedback_events
-             WHERE sender = ?1 AND ts >= ?2
-             GROUP BY target_agent
-             ORDER BY positive_flow DESC
-             LIMIT 20",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![agent_id, since as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u32,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
-        rows.collect()
-    }
-
     fn store_raw_envelope(
         &self,
         agent_id: &str,
@@ -1861,8 +1605,6 @@ struct Inner {
     agents: HashMap<String, AgentReputation>,
     /// Bounded ring buffer of recent interactions (used as fallback when no SQLite).
     interactions: VecDeque<RawInteraction>,
-    /// Maps agent_id -> c_coefficient (clustering factor) derived from on-chain Solana tokens.
-    solana_flow_clusters: HashMap<String, f64>,
 }
 
 // ============================================================================
@@ -2041,7 +1783,6 @@ impl ReputationStore {
             inner: Arc::new(RwLock::new(Inner {
                 agents,
                 interactions: VecDeque::new(),
-                solana_flow_clusters: HashMap::new(),
             })),
             db: Arc::new(Mutex::new(Some(db))),
             started_at: now_secs(),
@@ -2353,87 +2094,6 @@ impl ReputationStore {
                 }
                 None
             }
-            IngestEvent::Verdict(v) => {
-                if !is_valid_agent_id(&v.recipient) {
-                    tracing::warn!("Ingest: invalid recipient '{}' — dropped", &v.recipient);
-                    return None;
-                }
-                let rep = inner
-                    .agents
-                    .entry(v.recipient.clone())
-                    .or_insert_with(|| AgentReputation::new(v.recipient.clone()));
-                rep.apply_verdict();
-                let rep = rep.clone();
-                drop(inner);
-                self.persist(&rep);
-
-                let ts = now_secs();
-                let db = self.db.lock().unwrap();
-                if let Some(ref conn) = *db {
-                    let name = conn.query_agent_name(&v.sender).ok().flatten();
-                    let target_name = conn.query_agent_name(&v.recipient).ok().flatten();
-                    let ev = ActivityEvent {
-                        id: 0,
-                        ts: ts as i64,
-                        event_type: "VERDICT".to_string(),
-                        agent_id: v.sender.clone(),
-                        target_id: Some(v.recipient.clone()),
-                        score: None,
-                        name,
-                        target_name,
-                        slot: Some(v.slot as i64),
-                        conversation_id: Some(v.conversation_id.clone()),
-                    };
-                    match conn.insert_activity(&ev) {
-                        Ok(saved) => return Some(saved),
-                        Err(e) => tracing::warn!("SQLite insert_activity(VERDICT) failed: {e}"),
-                    }
-                }
-                None
-            }
-            IngestEvent::Entropy(ev) => {
-                if !is_valid_agent_id(&ev.agent_id) {
-                    tracing::warn!(
-                        "Ingest: invalid agent_id in ENTROPY '{}' — dropped",
-                        &ev.agent_id
-                    );
-                    return None;
-                }
-                drop(inner);
-                let ts = now_secs();
-                tracing::debug!(
-                    "ENTROPY epoch={} agent={} anomaly={:.4}",
-                    ev.epoch,
-                    &ev.agent_id[..8],
-                    ev.anomaly,
-                );
-                let db = self.db.lock().unwrap();
-                if let Some(ref conn) = *db {
-                    if let Err(e) = conn.upsert_entropy(&ev, ts) {
-                        tracing::warn!("SQLite upsert_entropy failed: {e}");
-                    }
-                }
-                None
-            }
-            IngestEvent::NotarizeBid(bid) => {
-                if !is_valid_agent_id(&bid.sender) {
-                    tracing::warn!(
-                        "Ingest: invalid sender in NOTARIZE_BID '{}' — dropped",
-                        &bid.sender
-                    );
-                    return None;
-                }
-                drop(inner);
-                let ts = now_secs();
-                tracing::debug!("NOTARIZE_BID sender={}", &bid.sender[..8]);
-                let db = self.db.lock().unwrap();
-                if let Some(ref conn) = *db {
-                    if let Err(e) = conn.insert_notarize_bid(&bid, ts) {
-                        tracing::warn!("SQLite insert_notarize_bid failed: {e}");
-                    }
-                }
-                None
-            }
             IngestEvent::Advertise(ad) => {
                 if !is_valid_agent_id(&ad.sender) {
                     tracing::warn!(
@@ -2688,51 +2348,400 @@ impl ReputationStore {
                 }
                 None
             }
-            IngestEvent::Latency(lev) => {
-                if !is_valid_agent_id(&lev.agent_id) {
-                    tracing::warn!(
-                        "Ingest: invalid agent_id in LATENCY '{}' — dropped",
-                        &lev.agent_id
-                    );
+            IngestEvent::Assign(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in ASSIGN — dropped");
                     return None;
                 }
-                // Sanity-check region: max 32 chars, alphanumeric + hyphen.
-                let region = lev.region.trim();
-                if region.is_empty()
-                    || region.len() > 32
-                    || !region
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-                {
-                    tracing::warn!("Ingest: invalid region in LATENCY '{}' — dropped", region);
-                    return None;
-                }
-                // Cap RTT at 10 000 ms — anything higher is noise / timeout.
-                let rtt_ms = lev.rtt_ms.min(10_000);
-                let ts = now_secs();
                 drop(inner);
-
-                // Persist to DB.
+                let ts = now_secs();
+                tracing::info!(
+                    "ASSIGN sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
                 let db = self.db.lock().unwrap();
                 if let Some(ref conn) = *db {
-                    if let Err(e) = conn.upsert_latency(&lev.agent_id, region, rtt_ms, ts) {
-                        tracing::warn!("upsert_latency failed: {e}");
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "ASSIGN".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(ASSIGN) failed: {e}"),
                     }
                 }
-                drop(db);
-
-                // Update in-memory latency and recompute geo_consistent.
-                let mut inner = self.inner.write().unwrap();
-                if let Some(rep) = inner.agents.get_mut(&lev.agent_id) {
-                    rep.latency.insert(region.to_string(), rtt_ms);
-                    if let Some(ref country) = rep.country.clone() {
-                        rep.geo_consistent = compute_geo_consistent(country, &rep.latency);
-                    }
+                None
+            }
+            IngestEvent::Ack(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in ACK — dropped");
+                    return None;
                 }
-                tracing::debug!(
-                    "LATENCY agent={} region={region} rtt={rtt_ms}ms",
-                    &lev.agent_id[..8],
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "ACK sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
                 );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "ACK".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(ACK) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Clarify(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in CLARIFY — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "CLARIFY sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "CLARIFY".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(CLARIFY) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Report(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in REPORT — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "REPORT sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "REPORT".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(REPORT) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Approve(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in APPROVE — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "APPROVE sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "APPROVE".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(APPROVE) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::TaskCancel(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in TASK_CANCEL — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "TASK_CANCEL sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "TASK_CANCEL".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(TASK_CANCEL) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Escalate(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in ESCALATE — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::warn!(
+                    "ESCALATE sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "ESCALATE".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(ESCALATE) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Sync(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in SYNC — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "SYNC sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "SYNC".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(SYNC) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Propose(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in PROPOSE — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "PROPOSE sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "PROPOSE".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(PROPOSE) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Counter(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in COUNTER — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "COUNTER sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "COUNTER".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(COUNTER) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::Accept(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in ACCEPT — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "ACCEPT sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "ACCEPT".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(ACCEPT) failed: {e}"),
+                    }
+                }
+                None
+            }
+            IngestEvent::DealCancel(ev) => {
+                if !is_valid_agent_id(&ev.sender) {
+                    tracing::warn!("Ingest: invalid sender in DEAL_CANCEL — dropped");
+                    return None;
+                }
+                drop(inner);
+                let ts = now_secs();
+                tracing::info!(
+                    "DEAL_CANCEL sender={} recipient={}",
+                    &ev.sender[..8.min(ev.sender.len())],
+                    &ev.recipient[..8.min(ev.recipient.len())],
+                );
+                let db = self.db.lock().unwrap();
+                if let Some(ref conn) = *db {
+                    let act = ActivityEvent {
+                        id: 0,
+                        ts: ts as i64,
+                        event_type: "DEAL_CANCEL".to_string(),
+                        agent_id: ev.sender.clone(),
+                        target_id: Some(ev.recipient.clone()),
+                        score: None,
+                        name: conn.query_agent_name(&ev.sender).ok().flatten(),
+                        target_name: conn.query_agent_name(&ev.recipient).ok().flatten(),
+                        slot: Some(ev.slot as i64),
+                        conversation_id: Some(ev.conversation_id.clone()),
+                    };
+                    match conn.insert_activity(&act) {
+                        Ok(saved) => return Some(saved),
+                        Err(e) => tracing::warn!("SQLite insert_activity(DEAL_CANCEL) failed: {e}"),
+                    }
+                }
                 None
             }
         }
@@ -3224,158 +3233,6 @@ impl ReputationStore {
         }
     }
 
-    /// Dynamic required stake for an agent (GAP-08, now includes C coefficient from GAP-02).
-    ///
-    /// Formula: required = BASE × (1 + β₁·A + β₃·C)
-    pub fn required_stake(&self, agent_id: &str) -> RequiredStakeResult {
-        const BASE_STAKE_USDC: f64 = 10.0;
-        const BETA_1: f64 = 0.870;
-        const BETA_3: f64 = 0.300;
-
-        let anomaly = {
-            let db = self.db.lock().unwrap();
-            if let Some(ref conn) = *db {
-                conn.query_latest_anomaly(agent_id)
-                    .unwrap_or(None)
-                    .unwrap_or(0.0)
-            } else {
-                0.0
-            }
-        };
-        let c = self.agent_c_coefficient(agent_id);
-
-        let required = BASE_STAKE_USDC * (1.0 + BETA_1 * anomaly + BETA_3 * c);
-        let deficit = (required - BASE_STAKE_USDC).max(0.0);
-
-        RequiredStakeResult {
-            agent_id: agent_id.to_string(),
-            base_stake_usdc: BASE_STAKE_USDC,
-            current_anomaly: anomaly,
-            c_coefficient: c,
-            beta_1: BETA_1,
-            beta_3: BETA_3,
-            required_stake_usdc: required,
-            deficit_usdc: deficit,
-        }
-    }
-
-    // =========================================================================
-    // Capital flow graph (GAP-02)
-    // =========================================================================
-
-    /// Capital flow edges over the last `window_secs` seconds.
-    pub fn capital_flow_edges(&self, window_secs: u64, limit: usize) -> Vec<CapitalFlowEdge> {
-        let since = now_secs().saturating_sub(window_secs);
-        let db = self.db.lock().unwrap();
-        if let Some(ref conn) = *db {
-            match conn.query_capital_flow_edges(since, limit) {
-                Ok(rows) => return rows,
-                Err(e) => tracing::warn!("query_capital_flow_edges failed: {e}"),
-            }
-        }
-        vec![]
-    }
-
-    /// All ownership clusters detected via mutual flow analysis.
-    pub fn flow_clusters(&self, window_secs: u64) -> Vec<FlowCluster> {
-        let edges = self.capital_flow_edges(window_secs, 5_000);
-        let (_, clusters) = compute_clusters_from_edges(&edges);
-        clusters
-    }
-
-    /// Graph position + C coefficient for one agent.
-    pub fn agent_flow_info(&self, agent_id: &str, window_secs: u64) -> AgentFlowInfo {
-        let since = now_secs().saturating_sub(window_secs);
-
-        // Outgoing flows for this agent.
-        let outgoing: Vec<(String, u32, i64)> = {
-            let db = self.db.lock().unwrap();
-            if let Some(ref conn) = *db {
-                conn.query_agent_outgoing(agent_id, since)
-                    .unwrap_or_default()
-            } else {
-                vec![]
-            }
-        };
-
-        let total_flow: i64 = outgoing.iter().map(|(_, _, f)| f).sum();
-        let unique = outgoing.len() as u32;
-
-        // Concentration ratio: fraction of flow to top-3 counterparties.
-        let top3_flow: i64 = outgoing.iter().take(3).map(|(_, _, f)| f).sum();
-        let concentration = if total_flow > 0 {
-            top3_flow as f64 / total_flow as f64
-        } else {
-            0.0
-        };
-        let top_counterparties: Vec<String> = outgoing
-            .iter()
-            .take(5)
-            .map(|(id, _, _)| id.clone())
-            .collect();
-
-        // Cluster membership.
-        let edges = self.capital_flow_edges(window_secs, 5_000);
-        let (agent_cluster, clusters) = compute_clusters_from_edges(&edges);
-        let cluster_id = agent_cluster.get(agent_id).copied();
-        let c_coeff = cluster_id
-            .and_then(|cid| clusters.iter().find(|c| c.cluster_id == cid))
-            .map(|c| c.c_coefficient)
-            .unwrap_or(0.0);
-
-        AgentFlowInfo {
-            agent_id: agent_id.to_string(),
-            cluster_id,
-            c_coefficient: c_coeff,
-            concentration_ratio: concentration,
-            top_counterparties,
-            total_outgoing_flow: total_flow,
-            unique_counterparties: unique,
-        }
-    }
-
-    /// C coefficient for a single agent (0.0 when not in any cluster).
-    /// Uses the Solana on-chain Capital Flow graph (GAP-02) computed by the background indexer.
-    pub fn agent_c_coefficient(&self, agent_id: &str) -> f64 {
-        let inner = self.inner.read().unwrap();
-        inner
-            .solana_flow_clusters
-            .get(agent_id)
-            .copied()
-            .unwrap_or(0.0)
-    }
-
-    // =========================================================================
-    // External Indexer Hooks (GAP-02)
-    // =========================================================================
-
-    /// Returns the pubkeys of all agents currently in the local reputation store.
-    pub async fn get_active_agent_pubkeys(&self) -> anyhow::Result<Vec<String>> {
-        let inner = self.inner.read().unwrap();
-        Ok(inner.agents.keys().cloned().collect())
-    }
-
-    /// Stores the computed on-chain clusters. The C coefficient is derived from cluster size.
-    pub async fn update_capital_flow_clusters(
-        &self,
-        clusters: Vec<Vec<String>>,
-    ) -> anyhow::Result<()> {
-        let mut inner = self.inner.write().unwrap();
-        inner.solana_flow_clusters.clear();
-
-        for cluster_agents in clusters {
-            // C multiplier calculation based closely on the paper/placeholder logic.
-            // i.e., larger group of linked ownership = higher multiplier.
-            let suspicion = ((cluster_agents.len() - 1) as f64 / 10.0).min(1.0);
-            for agent_id in cluster_agents {
-                inner.solana_flow_clusters.insert(agent_id, suspicion);
-            }
-        }
-
-        tracing::debug!("Updated solana_flow_clusters map with on-chain data.");
-        Ok(())
-    }
-
     /// Write a single reputation record to SQLite (fire-and-forget; failures are logged).
     fn persist(&self, rep: &AgentReputation) {
         let db = self.db.lock().unwrap();
@@ -3483,11 +3340,10 @@ impl ReputationStore {
         vec![]
     }
 
-    /// Full agent profile — combines reputation, entropy, capabilities, disputes, and name
+    /// Full agent profile — combines reputation, capabilities, disputes, and name
     /// into a single response to avoid multiple round trips.
     pub fn agent_profile(&self, agent_id: &str) -> AgentProfile {
         let reputation = self.get(agent_id);
-        let entropy = self.entropy_latest(agent_id);
         let capabilities = self.search_by_capability_for_agent(agent_id);
         let disputes = self.disputes_for_agent(agent_id, 5);
         let last_seen = reputation.as_ref().map(|r| r.last_seen);
@@ -3502,7 +3358,6 @@ impl ReputationStore {
             agent_id: agent_id.to_string(),
             name,
             reputation,
-            entropy,
             capabilities,
             disputes,
             last_seen,
