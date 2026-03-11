@@ -1,8 +1,8 @@
-//! Visualization API + Agent Integration API.
+//! Enterprise Node API — Agent integration and visualization.
 //!
 //! Visualization (read-only):
 //!   GET  /ws/events              — WebSocket stream of node events
-//!   GET  /peers                  — All known peers with SATI/lease status
+//!   GET  /peers                  — All known peers and reputation status
 //!   GET  /reputation/{agent_id}  — Reputation vector for an agent
 //!   GET  /batch/{agent_id}/{epoch} — Batch summary (own node only)
 //!
@@ -13,24 +13,14 @@
 //! High-level negotiation (encode + send in one call):
 //!   POST /negotiate/propose      — Send PROPOSE with structured payload
 //!   POST /negotiate/counter      — Send COUNTER with structured payload
-//!   POST /negotiate/accept       — Send ACCEPT with agreed amount encoded
+//!   POST /negotiate/accept       — Send ACCEPT
 //!   POST /hosted/negotiate/propose  — Same, for hosted agents (Bearer token)
 //!   POST /hosted/negotiate/counter  — Same, for hosted agents
 //!   POST /hosted/negotiate/accept   — Same, for hosted agents
-//!
-//! Escrow (explicit on-chain locking):
-//!   POST /escrow/lock            — Lock USDC in escrow (requester → provider)
-//!   POST /escrow/approve         — Approve and release locked payment
-//!
-//! 8004 Solana Agent Registry:
-//!   GET  /registry/8004/info              — Program IDs, collection, step-by-step guide
-//!   POST /registry/8004/register-prepare  — Build partially-signed tx (agent signs message_b64)
-//!   POST /registry/8004/register-submit   — Inject owner sig + broadcast to Solana
 
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::PathBuf,
     sync::Arc,
 };
 
@@ -72,7 +62,6 @@ pub struct ReputationSnapshot {
     pub agent_id: String,
     pub reliability: i64,
     pub cooperation: i64,
-    pub notary_accuracy: i64,
     pub total_tasks: u32,
     pub total_disputes: u32,
     pub last_active_epoch: u64,
@@ -116,34 +105,6 @@ pub enum ApiEvent {
 }
 
 // ============================================================================
-// Portfolio types
-// ============================================================================
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PortfolioEvent {
-    Swap {
-        input_mint: String,
-        output_mint: String,
-        input_amount: f64,
-        output_amount: f64,
-        txid: String,
-        timestamp: u64,
-    },
-    Bounty {
-        amount_usdc: f64,
-        from_agent: String,
-        conversation_id: String,
-        timestamp: u64,
-    },
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-pub struct PortfolioHistory {
-    pub events: Vec<PortfolioEvent>,
-}
-
-// ============================================================================
 // Agent integration types
 // ============================================================================
 
@@ -169,22 +130,12 @@ pub struct SentConfirmation {
 
 // ── Negotiate endpoint types ──────────────────────────────────────────────
 
-/// Build the standard negotiate payload wire format:
-/// `[16-byte LE i128 amount_usdc_micro][JSON extra]`
-fn build_negotiate_payload(amount_usdc_micro: u64, extra: serde_json::Value) -> Vec<u8> {
-    let mut payload = (amount_usdc_micro as i128).to_le_bytes().to_vec();
-    payload.extend_from_slice(extra.to_string().as_bytes());
-    payload
-}
-
 /// Request body for POST /negotiate/propose (and /hosted/negotiate/propose).
 #[derive(Deserialize)]
 pub struct NegotiateProposeRequest {
     pub recipient: String,
     /// 16-byte hex conversation ID. Auto-generated if omitted.
     pub conversation_id: Option<String>,
-    /// Bid amount in USDC microunits. Default: 0 (unspecified).
-    pub amount_usdc_micro: Option<u64>,
     /// Max counter rounds (default: 2).
     pub max_rounds: Option<u8>,
     pub message: String,
@@ -195,7 +146,6 @@ pub struct NegotiateProposeRequest {
 pub struct NegotiateCounterRequest {
     pub recipient: String,
     pub conversation_id: String,
-    pub amount_usdc_micro: u64,
     pub round: u8,
     pub max_rounds: Option<u8>,
     pub message: Option<String>,
@@ -206,7 +156,6 @@ pub struct NegotiateCounterRequest {
 pub struct NegotiateAcceptRequest {
     pub recipient: String,
     pub conversation_id: String,
-    pub amount_usdc_micro: u64,
     pub message: Option<String>,
 }
 
@@ -334,12 +283,6 @@ pub struct ApiInner {
 
     /// Shared HTTP client for outbound requests.
     pub(crate) http_client: reqwest::Client,
-    /// The current slot (for informational purposes), updated periodically.
-    current_slot: core::sync::atomic::AtomicU64,
-
-    // Portfolio state
-    pub portfolio_history: RwLock<PortfolioHistory>,
-    portfolio_persist_path: RwLock<PathBuf>,
 
     // Agent (zeroclaw) process management
     /// PID of the running zeroclaw agent process. Set by POST /agent/register-pid.
@@ -407,9 +350,6 @@ impl ApiState {
                 count: 0,
             }),
             http_client,
-            current_slot: core::sync::atomic::AtomicU64::new(0),
-            portfolio_history: RwLock::new(PortfolioHistory::default()),
-            portfolio_persist_path: RwLock::new(PathBuf::new()), // set during init
             agent_pid: Mutex::new(None),
             agent_reload_rate_limit: Mutex::new(RateLimitWindow {
                 window_start: now_secs(),
@@ -419,35 +359,6 @@ impl ApiState {
         }));
 
         (state, outbound_rx, hosted_outbound_rx)
-    }
-
-    pub async fn load_portfolio_history(&self, path: PathBuf) -> anyhow::Result<()> {
-        *self.0.portfolio_persist_path.write().await = path.clone();
-
-        if path.exists() {
-            let data = tokio::fs::read_to_string(&path).await?;
-            let history: PortfolioHistory = serde_json::from_str(&data)?;
-            *self.0.portfolio_history.write().await = history;
-        }
-        Ok(())
-    }
-
-    pub async fn record_portfolio_event(&self, event: PortfolioEvent) {
-        let mut history = self.0.portfolio_history.write().await;
-        history.events.insert(0, event);
-        if history.events.len() > 1000 {
-            history.events.truncate(1000);
-        }
-
-        // Persist asynchronously — drop the write lock first so other tasks
-        // can access portfolio_history while we do the (potentially slow) write.
-        let path = self.0.portfolio_persist_path.read().await.clone();
-        if !path.as_os_str().is_empty() {
-            if let Ok(json) = serde_json::to_string_pretty(&*history) {
-                drop(history);
-                let _ = tokio::fs::write(&path, json).await;
-            }
-        }
     }
 
     // ── Visualization update helpers ─────────────────────────────────────────
@@ -473,18 +384,12 @@ impl ApiState {
         let _ = self.0.event_tx.send(event);
     }
 
-    pub fn get_current_slot(&self) -> u64 {
-        self.0
-            .current_slot
-            .load(core::sync::atomic::Ordering::Relaxed)
-    }
-
     // ── Agent integration helpers ─────────────────────────────────────────────
 
     /// Push a validated inbound envelope to all /ws/inbox subscribers.
     ///
     /// Called by the node loop after every successfully validated envelope.
-    pub fn push_inbound(&self, env: &zerox1_protocol::envelope::Envelope, slot: u64) {
+    pub fn push_inbound(&self, env: &zerox1_protocol::envelope::Envelope) {
         // Decode protocol-defined payloads for convenience.
         let feedback = if env.msg_type == zerox1_protocol::message::MsgType::Feedback {
             FeedbackPayload::decode(&env.payload).ok().map(|p| {
@@ -494,7 +399,6 @@ impl ApiState {
                     "score":           p.score,
                     "outcome":         p.outcome,
                     "is_dispute":      p.is_dispute,
-                    "role":            p.role,
                 })
             })
         } else {
@@ -506,7 +410,7 @@ impl ApiState {
             sender: hex::encode(env.sender),
             recipient: hex::encode(env.recipient),
             conversation_id: hex::encode(env.conversation_id),
-            slot,
+            slot: now_secs(),
             nonce: env.nonce,
             payload_b64: B64.encode(&env.payload),
             feedback,
@@ -955,15 +859,12 @@ async fn negotiate_propose(
             (hex::encode(b), b)
         }
     };
-    let amount = req.amount_usdc_micro.unwrap_or(0);
     let max_rounds = req.max_rounds.unwrap_or(2);
-    let payload = build_negotiate_payload(
-        amount,
-        serde_json::json!({
-            "max_rounds": max_rounds,
-            "message": req.message,
-        }),
-    );
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "max_rounds": max_rounds,
+        "message": req.message,
+    }))
+    .unwrap_or_default();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let outbound = OutboundRequest {
         msg_type: MsgType::Propose,
@@ -1060,14 +961,12 @@ async fn negotiate_counter(
             )
         }
     };
-    let payload = build_negotiate_payload(
-        req.amount_usdc_micro,
-        serde_json::json!({
-            "round": req.round,
-            "max_rounds": max_rounds,
-            "message": req.message.unwrap_or_default(),
-        }),
-    );
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "round": req.round,
+        "max_rounds": max_rounds,
+        "message": req.message.unwrap_or_default(),
+    }))
+    .unwrap_or_default();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let outbound = OutboundRequest {
         msg_type: MsgType::Counter,
@@ -1151,12 +1050,10 @@ async fn negotiate_accept(
             )
         }
     };
-    let payload = build_negotiate_payload(
-        req.amount_usdc_micro,
-        serde_json::json!({
-            "message": req.message.unwrap_or_default(),
-        }),
-    );
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "message": req.message.unwrap_or_default(),
+    }))
+    .unwrap_or_default();
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let outbound = OutboundRequest {
         msg_type: MsgType::Accept,
@@ -1424,7 +1321,7 @@ async fn hosted_send(
             msg_type,
             session.agent_id,
             recipient,
-            state.get_current_slot(),
+            now_secs(),
             session.nonce,
             conversation_id,
             payload,
@@ -1501,15 +1398,12 @@ async fn hosted_negotiate_propose(
             (hex::encode(b), b)
         }
     };
-    let amount = req.amount_usdc_micro.unwrap_or(0);
     let max_rounds = req.max_rounds.unwrap_or(2);
-    let payload = build_negotiate_payload(
-        amount,
-        serde_json::json!({
-            "max_rounds": max_rounds,
-            "message": req.message,
-        }),
-    );
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "max_rounds": max_rounds,
+        "message": req.message,
+    }))
+    .unwrap_or_default();
     let env = {
         let now = now_secs();
         let mut sessions = state.0.hosted_sessions.write().await;
@@ -1545,7 +1439,7 @@ async fn hosted_negotiate_propose(
             MsgType::Propose,
             session.agent_id,
             recipient,
-            state.get_current_slot(),
+            now_secs(),
             session.nonce,
             conversation_id,
             payload,
@@ -1629,14 +1523,12 @@ async fn hosted_negotiate_counter(
             )
         }
     };
-    let payload = build_negotiate_payload(
-        req.amount_usdc_micro,
-        serde_json::json!({
-            "round": req.round,
-            "max_rounds": max_rounds,
-            "message": req.message.unwrap_or_default(),
-        }),
-    );
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "round": req.round,
+        "max_rounds": max_rounds,
+        "message": req.message.unwrap_or_default(),
+    }))
+    .unwrap_or_default();
     let env = {
         let now = now_secs();
         let mut sessions = state.0.hosted_sessions.write().await;
@@ -1672,7 +1564,7 @@ async fn hosted_negotiate_counter(
             MsgType::Counter,
             session.agent_id,
             recipient,
-            state.get_current_slot(),
+            now_secs(),
             session.nonce,
             conversation_id,
             payload,
@@ -1744,12 +1636,10 @@ async fn hosted_negotiate_accept(
             )
         }
     };
-    let payload = build_negotiate_payload(
-        req.amount_usdc_micro,
-        serde_json::json!({
-            "message": req.message.unwrap_or_default(),
-        }),
-    );
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "message": req.message.unwrap_or_default(),
+    }))
+    .unwrap_or_default();
     let env = {
         let now = now_secs();
         let mut sessions = state.0.hosted_sessions.write().await;
@@ -1785,7 +1675,7 @@ async fn hosted_negotiate_accept(
             MsgType::Accept,
             session.agent_id,
             recipient,
-            state.get_current_slot(),
+            now_secs(),
             session.nonce,
             conversation_id,
             payload,

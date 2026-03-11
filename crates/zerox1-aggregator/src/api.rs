@@ -11,8 +11,8 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::store::{
-    ActivityEvent, AgentProfile, AgentRegistryEntry, CapabilityMatch, DisputeRecord, HostingNode,
-    IngestEvent, NetworkStats, OwnerStatus, PendingMessage, ReputationStore,
+    ActivityEvent, AgentProfile, AgentRegistryEntry, CapabilityMatch, HostingNode, IngestEvent,
+    NetworkStats, ReputationStore,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use std::path::PathBuf;
@@ -32,12 +32,6 @@ pub struct AppState {
     /// Shared secret for POST /hosting/register.
     /// None = unauthenticated (dev/local only); set in production.
     pub hosting_secret: Option<String>,
-    /// Firebase server key for sending FCM push notifications.
-    /// Required for the sleeping node wake-push feature.
-    /// Set via --fcm-server-key / FCM_SERVER_KEY env var.
-    pub fcm_server_key: Option<String>,
-    /// Shared HTTP client for FCM push calls.
-    pub http_client: reqwest::Client,
     /// Broadcast channel for real-time activity events (GET /ws/activity).
     pub activity_tx: broadcast::Sender<ActivityEvent>,
     /// Path to store media blobs.
@@ -97,20 +91,11 @@ pub async fn api_key_middleware(
 }
 
 // ============================================================================
-// Agent ID validation — accepts legacy hex (64 chars) and 8004 base58 (32-44)
+// Agent ID validation — 64-char hex Ed25519 verifying key
 // ============================================================================
 
 fn is_valid_agent_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 64 {
-        return false;
-    }
-    if id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()) {
-        return true;
-    }
-    if id.len() >= 32 && id.len() <= 44 && bs58::decode(id).into_vec().is_ok() {
-        return true;
-    }
-    false
+    id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 // ============================================================================
@@ -345,65 +330,6 @@ fn parse_window(s: &str) -> u64 {
     }
 }
 
-// ============================================================================
-// Entropy
-// ============================================================================
-
-/// GET /leaderboard/anomaly[?limit=50]
-///
-/// Agents ranked by highest anomaly score (most recent epoch per agent).
-/// Score > 0 means at least one entropy component fell below its threshold.
-/// Higher score = more suspicious.
-pub async fn get_anomaly_leaderboard(
-    State(state): State<AppState>,
-    Query(params): Query<LeaderboardParams>,
-) -> impl IntoResponse {
-    let limit = params.limit.min(200);
-    Json(state.store.anomaly_leaderboard(limit))
-}
-
-/// GET /entropy/:agent_id
-///
-/// Latest entropy vector for the agent (the most recent epoch).
-/// Returns 404 when the agent has no recorded entropy yet.
-pub async fn get_entropy(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-) -> impl IntoResponse {
-    match state.store.entropy_latest(&agent_id) {
-        Some(ev) => Json(serde_json::to_value(ev).unwrap_or_default()).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no entropy data for agent" })),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct EntropyHistoryParams {
-    #[serde(default = "default_entropy_limit")]
-    limit: usize,
-}
-
-fn default_entropy_limit() -> usize {
-    30
-}
-
-/// GET /entropy/:agent_id/history[?limit=30]
-///
-/// All recorded entropy vectors for the agent (newest first, up to 100).
-/// Useful for plotting anomaly score over time.
-pub async fn get_entropy_history(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    Query(params): Query<EntropyHistoryParams>,
-) -> impl IntoResponse {
-    let limit = params.limit.min(100);
-    let rows = state.store.entropy_history(&agent_id, limit);
-    Json(rows)
-}
-
 /// GET /stats/timeseries[?window=24h]
 ///
 /// Returns hourly feedback buckets (bucket = unix timestamp of window start).
@@ -415,92 +341,6 @@ pub async fn get_timeseries(
 ) -> impl IntoResponse {
     let window_secs = parse_window(&params.window);
     Json(state.store.timeseries(window_secs))
-}
-
-// ============================================================================
-// GAP-03: Rolling entropy — patient cartel detection
-// ============================================================================
-
-#[derive(Deserialize)]
-pub struct RollingEntropyParams {
-    #[serde(default = "default_rolling_window")]
-    window: u32,
-}
-
-fn default_rolling_window() -> u32 {
-    10
-}
-
-/// GET /entropy/{agent_id}/rolling[?window=10]
-pub async fn get_rolling_entropy(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    Query(params): Query<RollingEntropyParams>,
-) -> impl IntoResponse {
-    let window = params.window.clamp(3, 100);
-    Json(state.store.rolling_entropy(&agent_id, window))
-}
-
-// ============================================================================
-// GAP-04: Verifier concentration
-// ============================================================================
-
-/// GET /leaderboard/verifier-concentration[?limit=50]
-pub async fn get_verifier_concentration(
-    State(state): State<AppState>,
-    Query(params): Query<LeaderboardParams>,
-) -> impl IntoResponse {
-    let limit = params.limit.min(200);
-    Json(state.store.verifier_concentration(limit))
-}
-
-// ============================================================================
-// GAP-02: Ownership clustering
-// ============================================================================
-
-/// GET /leaderboard/ownership-clusters
-pub async fn get_ownership_clusters(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.store.ownership_clusters())
-}
-
-// ============================================================================
-// GAP-05: Calibrated β parameters
-// ============================================================================
-
-/// GET /params/calibrated
-pub async fn get_calibrated_params(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.store.calibrated_params())
-}
-
-// ============================================================================
-// GAP-06: SRI / circuit breaker
-// ============================================================================
-
-/// GET /system/sri
-pub async fn get_sri_status(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.store.sri_status())
-}
-
-// ============================================================================
-// GAP-07: Raw envelope retrieval for Merkle proof construction
-// ============================================================================
-
-#[derive(Deserialize)]
-pub struct EpochPath {
-    agent_id: String,
-    epoch: u64,
-}
-
-/// GET /epochs/{agent_id}/{epoch}/envelopes
-///
-/// Returns ordered raw CBOR envelope bytes for a specific agent epoch.
-/// Used by the challenger bot to construct Merkle inclusion proofs.
-/// Up to 1000 entries, ordered by sequence (node's log order).
-pub async fn get_epoch_envelopes(
-    State(state): State<AppState>,
-    Path(params): Path<EpochPath>,
-) -> impl IntoResponse {
-    Json(state.store.epoch_envelopes(&params.agent_id, params.epoch))
 }
 
 // ============================================================================
@@ -616,245 +456,6 @@ pub async fn get_interactions_by(
 }
 
 // ============================================================================
-// Disputes
-// ============================================================================
-
-#[derive(Deserialize)]
-pub struct DisputeParams {
-    #[serde(default = "default_limit")]
-    limit: usize,
-}
-
-/// GET /disputes/{agent_id}[?limit=50]
-///
-/// Returns recent disputes targeting the given agent, newest first.
-/// Used by the challenger bot to identify agents that should be investigated.
-pub async fn get_disputes(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    Query(params): Query<DisputeParams>,
-) -> impl IntoResponse {
-    let limit: usize = params.limit.min(500);
-    let results: Vec<DisputeRecord> = state.store.disputes_for_agent(&agent_id, limit);
-    Json(results)
-}
-
-// ============================================================================
-// FCM / Sleeping node
-// ============================================================================
-
-#[derive(Deserialize)]
-pub struct FcmRegisterBody {
-    pub agent_id: String,
-    pub fcm_token: String,
-}
-
-#[derive(Deserialize)]
-pub struct FcmSleepBody {
-    pub agent_id: String,
-    pub sleeping: bool,
-}
-
-#[derive(Deserialize)]
-pub struct PostPendingBody {
-    /// Hex-encoded agent_id of the sender.
-    pub from: String,
-    /// Protocol message type, e.g. "PROPOSE".
-    pub msg_type: String,
-    /// Base64-encoded raw CBOR envelope bytes.
-    pub payload: String,
-}
-
-fn decode_pubkey_bytes(pubkey: &str) -> Result<[u8; 32], StatusCode> {
-    let bytes = if let Ok(decoded) = hex::decode(pubkey) {
-        decoded
-    } else if let Ok(decoded) = bs58::decode(pubkey).into_vec() {
-        decoded
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-
-    bytes.try_into().map_err(|_| StatusCode::BAD_REQUEST)
-}
-
-/// Helper to verify Ed25519 signature from headers.
-fn verify_request_signature(pubkey: &str, signature: &str, body: &[u8]) -> Result<(), StatusCode> {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-    let pubkey_arr = decode_pubkey_bytes(pubkey)?;
-    let pubkey = VerifyingKey::from_bytes(&pubkey_arr).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let sig_bytes = hex::decode(signature).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let sig = Signature::from_slice(&sig_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    pubkey
-        .verify(body, &sig)
-        .map_err(|_| StatusCode::UNAUTHORIZED)
-}
-
-/// POST /fcm/register
-///
-/// Register or update the FCM device token for an agent.
-/// Called by a mobile node on startup to enable push-wake behaviour.
-/// Requirement: Must be signed by the agent (HIGH-7).
-pub async fn fcm_register(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    body_bytes: axum::body::Bytes,
-) -> Result<impl IntoResponse, StatusCode> {
-    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
-    let body_str = std::str::from_utf8(&body_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let body: FcmRegisterBody =
-        serde_json::from_str(body_str).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    if let Some(s) = sig {
-        verify_request_signature(&body.agent_id, s, &body_bytes)?;
-    } else {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    if !is_valid_agent_id(&body.agent_id) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    state
-        .store
-        .store_fcm_token(body.agent_id.clone(), body.fcm_token);
-    tracing::debug!("FCM token registered for agent {}", body.agent_id);
-    Ok(StatusCode::OK)
-}
-
-/// POST /fcm/sleep
-///
-/// Mark an agent as sleeping (offline) or awake.
-/// Called by a mobile node before backgrounding and on wakeup.
-/// Requirement: Must be signed by the agent (HIGH-7).
-pub async fn fcm_sleep(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    body_bytes: axum::body::Bytes,
-) -> Result<impl IntoResponse, StatusCode> {
-    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
-    let body_str = std::str::from_utf8(&body_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let body: FcmSleepBody = serde_json::from_str(body_str).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    if let Some(s) = sig {
-        verify_request_signature(&body.agent_id, s, &body_bytes)?;
-    } else {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    if !is_valid_agent_id(&body.agent_id) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    state.store.set_sleeping(&body.agent_id, body.sleeping);
-    tracing::debug!(
-        "Agent {} sleep state → {}",
-        body.agent_id,
-        if body.sleeping { "sleeping" } else { "awake" }
-    );
-    Ok(StatusCode::OK)
-}
-
-/// GET /agents/{agent_id}/sleeping
-///
-/// Returns whether the agent is currently in sleep mode.
-/// Senders check this before posting a pending message.
-pub async fn get_sleep_status(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({ "sleeping": state.store.is_sleeping(&agent_id) }))
-}
-
-/// GET /agents/{agent_id}/pending
-///
-/// Drain and return all pending messages held for this agent.
-/// The queue is cleared on retrieval — messages are delivered exactly once.
-/// Returns 200 with an empty array when there are no pending messages.
-/// Requirement: Only the agent (pubkey) can drain its own queue (HIGH-8).
-pub async fn get_pending(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    headers: axum::http::HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
-    if let Some(s) = sig {
-        // For GET, we sign the path "agents/{agent_id}/pending"
-        let msg = format!("agents/{agent_id}/pending");
-        verify_request_signature(&agent_id, s, msg.as_bytes())?;
-    } else {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    let msgs = state.store.drain_pending(&agent_id);
-    // Mark the agent as awake now that it is polling.
-    state.store.set_sleeping(&agent_id, false);
-    Ok(Json(msgs))
-}
-
-/// POST /agents/{agent_id}/pending
-///
-/// Submit a message to be held for a sleeping agent.
-/// If the agent has a registered FCM token and is sleeping, a push
-/// notification is fired immediately to wake the app.
-/// Requirement: Validate that the sender (body.from) matches the signature (HIGH-9).
-pub async fn post_pending(
-    State(state): State<AppState>,
-    Path(agent_id): Path<String>,
-    headers: axum::http::HeaderMap,
-    body_bytes: axum::body::Bytes,
-) -> Result<impl IntoResponse, StatusCode> {
-    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
-    let body_str = std::str::from_utf8(&body_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let body: PostPendingBody =
-        serde_json::from_str(body_str).map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    if let Some(s) = sig {
-        // HIGH-9: Signature MUST match the sender (body.from)
-        verify_request_signature(&body.from, s, &body_bytes)?;
-    } else {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
-    if !is_valid_agent_id(&agent_id) {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    let msg = PendingMessage {
-        id: format!("{ts:016x}"),
-        from: body.from.clone(),
-        msg_type: body.msg_type.clone(),
-        payload: body.payload,
-        ts: (ts / 1_000_000_000) as u64,
-    };
-
-    state.store.push_pending(&agent_id, msg);
-
-    // Fire FCM push if the agent is sleeping and has a token.
-    if state.store.is_sleeping(&agent_id) {
-        if let Some(token) = state.store.get_fcm_token(&agent_id) {
-            if let Some(ref fcm_key) = state.fcm_server_key {
-                let client = state.http_client.clone();
-                let key = fcm_key.clone();
-                let aid = agent_id.clone();
-                let from = body.from.clone();
-                let msgtype = body.msg_type.clone();
-                tokio::spawn(async move {
-                    send_fcm_push(&key, &token, &aid, &from, &msgtype, &client).await;
-                });
-            }
-        }
-    }
-
-    Ok(StatusCode::ACCEPTED.into_response())
-}
-
-// ============================================================================
 // Activity feed
 // ============================================================================
 
@@ -925,51 +526,6 @@ pub async fn ws_activity(
             }
         }
     }))
-}
-
-/// Fire a Firebase Cloud Messaging push to wake a sleeping node.
-///
-/// Uses the FCM legacy HTTP API (v1 API requires OAuth2 which adds
-/// unnecessary complexity for this use-case).
-async fn send_fcm_push(
-    fcm_key: &str,
-    device_token: &str,
-    agent_id: &str,
-    from: &str,
-    msg_type: &str,
-    client: &reqwest::Client,
-) {
-    let payload = serde_json::json!({
-        "to": device_token,
-        "data": {
-            "action":   "wake",
-            "agent_id": agent_id,
-            "from":     from,
-            "msg_type": msg_type,
-        },
-        "notification": {
-            "title": "0x01 — New job offer",
-            "body":  format!("{msg_type} from {}", &from[..8.min(from.len())]),
-        },
-    });
-
-    match client
-        .post("https://fcm.googleapis.com/fcm/send")
-        .header("Authorization", format!("key={fcm_key}"))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(resp) if resp.status().is_success() => {
-            tracing::debug!("FCM push sent for agent {agent_id}");
-        }
-        Ok(resp) => {
-            tracing::warn!("FCM push HTTP {} for agent {agent_id}", resp.status());
-        }
-        Err(e) => {
-            tracing::warn!("FCM push error for agent {agent_id}: {e}");
-        }
-    }
 }
 
 // ============================================================================
@@ -1050,6 +606,23 @@ fn is_rfc1918_172(host: &str) -> bool {
     false
 }
 
+fn decode_pubkey_bytes(pubkey: &str) -> Result<[u8; 32], StatusCode> {
+    hex::decode(pubkey)
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .try_into()
+        .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn verify_request_signature(pubkey: &str, signature: &str, body: &[u8]) -> Result<(), StatusCode> {
+    let pubkey_arr = decode_pubkey_bytes(pubkey)?;
+    let pubkey = VerifyingKey::from_bytes(&pubkey_arr).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig_bytes = hex::decode(signature).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+    pubkey
+        .verify(body, &sig)
+        .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
 /// POST /hosting/register — called by host nodes on startup and every 60s.
 ///
 /// Requires `Authorization: Bearer <hosting_secret>` when `--hosting-secret`
@@ -1107,191 +680,6 @@ pub async fn get_hosting_nodes(State(state): State<AppState>) -> impl IntoRespon
 }
 
 // ============================================================================
-// Agent ownership claim handlers
-// ============================================================================
-
-/// Request body for POST /agents/:agent_id/propose-owner.
-#[derive(Deserialize)]
-pub struct ProposeOwnerBody {
-    /// Base58-encoded Solana wallet address of the intended human owner.
-    pub proposed_owner: String,
-}
-
-/// Request body for POST /agents/:agent_id/claim-owner.
-///
-/// The human wallet that accepts the claim must submit their wallet address.
-/// The agent-ownership Solana program already enforces the on-chain claim;
-/// this endpoint records it in the aggregator so the profile shows "Claimed".
-#[derive(Deserialize)]
-pub struct ClaimOwnerBody {
-    /// Base58-encoded Solana wallet address of the human who accepted.
-    pub owner_wallet: String,
-}
-
-/// POST /agents/:agent_id/propose-owner
-///
-/// Called by the agent (or operator) to propose a human owner.
-/// The proposed_owner is stored as pending until the human calls /claim-owner.
-pub async fn post_propose_owner(
-    Path(agent_id): Path<String>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body_bytes: axum::body::Bytes,
-) -> impl IntoResponse {
-    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
-    let body_str = match std::str::from_utf8(&body_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid request body" })),
-            )
-        }
-    };
-    let body: ProposeOwnerBody = match serde_json::from_str(body_str) {
-        Ok(body) => body,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid request body" })),
-            )
-        }
-    };
-
-    if !is_valid_agent_id(&agent_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid agent_id" })),
-        );
-    }
-    // Validate proposed_owner: Solana base58 pubkeys are 32–44 chars.
-    if body.proposed_owner.len() < 32 || body.proposed_owner.len() > 44 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid proposed_owner (expected base58 Solana address)" })),
-        );
-    }
-    if let Some(s) = sig {
-        if let Err(status) = verify_request_signature(&agent_id, s, &body_bytes) {
-            return (status, Json(json!({ "error": "invalid agent signature" })));
-        }
-    } else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "missing X-Signature" })),
-        );
-    }
-
-    match state.store.propose_owner(&agent_id, &body.proposed_owner) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({
-                "status": "pending",
-                "agent_id": agent_id,
-                "proposed_owner": body.proposed_owner,
-            })),
-        ),
-        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))),
-    }
-}
-
-/// POST /agents/:agent_id/claim-owner
-///
-/// Called by the human wallet AFTER accepting the on-chain AgentOwnership PDA.
-/// Records the claim in the aggregator — the agent profile will now show
-/// `"status": "claimed"` with the owner's wallet address.
-pub async fn post_claim_owner(
-    Path(agent_id): Path<String>,
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body_bytes: axum::body::Bytes,
-) -> impl IntoResponse {
-    let sig = headers.get("X-Signature").and_then(|h| h.to_str().ok());
-    let body_str = match std::str::from_utf8(&body_bytes) {
-        Ok(s) => s,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid request body" })),
-            )
-        }
-    };
-    let body: ClaimOwnerBody = match serde_json::from_str(body_str) {
-        Ok(body) => body,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid request body" })),
-            )
-        }
-    };
-
-    if !is_valid_agent_id(&agent_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid agent_id" })),
-        );
-    }
-    if body.owner_wallet.len() < 32 || body.owner_wallet.len() > 44 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid owner_wallet (expected base58 Solana address)" })),
-        );
-    }
-    if let Some(s) = sig {
-        if let Err(status) = verify_request_signature(&body.owner_wallet, s, &body_bytes) {
-            return (status, Json(json!({ "error": "invalid owner signature" })));
-        }
-    } else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "missing X-Signature" })),
-        );
-    }
-
-    match state.store.claim_owner(&agent_id, &body.owner_wallet) {
-        Ok(record) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(record).unwrap_or_default()),
-        ),
-        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e }))),
-    }
-}
-
-/// GET /agents/:agent_id/owner
-///
-/// Returns the ownership status for an agent:
-///   - `{ "status": "unclaimed" }`
-///   - `{ "status": "pending",  "agent_id": "...", "proposed_owner": "...", "proposed_at": 123 }`
-///   - `{ "status": "claimed",  "agent_id": "...", "owner": "...", "claimed_at": 123 }`
-pub async fn get_agent_owner(
-    Path(agent_id): Path<String>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    let status: OwnerStatus = state.store.get_owner(&agent_id);
-    Json(serde_json::to_value(status).unwrap_or_default())
-}
-
-/// GET /agents/by-owner/:wallet
-///
-/// Reverse-lookup: returns all agents whose ownership has been claimed by the
-/// given Solana wallet address (base58, 32-44 chars).
-pub async fn get_agents_by_owner(
-    Path(wallet): Path<String>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
-    if wallet.len() < 32 || wallet.len() > 44 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid wallet" })),
-        )
-            .into_response();
-    }
-    let agents = state.store.get_agents_by_owner(&wallet);
-    Json(agents).into_response()
-}
-
-// ============================================================================
 // Blob Relay (Tiered Media Storage)
 // ============================================================================
 
@@ -1299,12 +687,10 @@ pub async fn get_agents_by_owner(
 ///
 /// Uploads a media blob.
 /// Required Headers:
-///   X-0x01-Agent-Id:  Hex-encoded 32-byte agent identity (SATI mint in SATI
-///                     mode; Ed25519 verifying key in dev mode).  Used for
-///                     reputation / tier lookup.
+///   X-0x01-Agent-Id:  Hex-encoded 32-byte Ed25519 verifying key (agent identity).
+///                     Used for reputation / tier lookup.
 ///   X-0x01-Signer:   Hex-encoded 32-byte Ed25519 verifying key that produced
-///                     X-0x01-Signature.  Optional: falls back to X-0x01-Agent-Id
-///                     when absent (dev mode — agent_id == verifying key).
+///                     X-0x01-Signature.  Optional: falls back to X-0x01-Agent-Id.
 ///   X-0x01-Timestamp: Unix seconds.
 ///   X-0x01-Signature: Ed25519 signature of body bytes || timestamp LE-u64.
 pub async fn post_blob(
@@ -1388,7 +774,7 @@ pub async fn post_blob(
 
     // 2. Verify Signature
     // Use X-0x01-Signer for the crypto check; it equals X-0x01-Agent-Id in
-    // dev mode, but is the node's Ed25519 key in SATI/8004 mode.
+    // enterprise mode: the node's Ed25519 verifying key.
     let signer_bytes = match hex::decode(signer_hex) {
         Ok(b) => b,
         Err(_) => {
@@ -1651,13 +1037,13 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_signature_accepts_base58_pubkeys() {
+    fn verify_request_signature_accepts_hex_pubkeys_hosting() {
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-        let body = br#"{"owner_wallet":"11111111111111111111111111111111"}"#;
+        let body = br#"{"node_id":"test"}"#;
         let sig = signing_key.sign(body);
 
         assert!(verify_request_signature(
-            &bs58::encode(signing_key.verifying_key().to_bytes()).into_string(),
+            &hex::encode(signing_key.verifying_key().to_bytes()),
             &hex::encode(sig.to_bytes()),
             body
         )

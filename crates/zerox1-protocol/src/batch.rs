@@ -13,9 +13,9 @@ pub struct TypedBid {
     pub conversation_id: [u8; 16],
     /// Agent receiving the bid.
     pub counterparty: [u8; 32],
-    /// Fixed-precision bid value, 18 decimal scaling (lamports × 10^18).
+    /// Fixed-precision bid value, 18 decimal scaling.
     pub bid_value: i128,
-    /// Solana slot at which bid was placed.
+    /// Unix timestamp (seconds) when bid was placed.
     pub slot: u64,
 }
 
@@ -27,19 +27,7 @@ pub struct TaskSelection {
     pub conversation_id: [u8; 16],
     /// Agent selected.
     pub counterparty: [u8; 32],
-    /// Slot of ACCEPT message.
-    pub slot: u64,
-}
-
-/// A notary assignment made by this agent during the epoch.
-/// Corresponds to a NOTARIZE_ASSIGN message.
-#[derive(Debug, Clone, PartialEq)]
-pub struct VerifierAssignment {
-    /// Task being notarized.
-    pub conversation_id: [u8; 16],
-    /// Notary agent assigned.
-    pub verifier_id: [u8; 32],
-    /// Slot of NOTARIZE_ASSIGN.
+    /// Unix timestamp (seconds) of ACCEPT message.
     pub slot: u64,
 }
 
@@ -48,41 +36,36 @@ pub struct VerifierAssignment {
 /// entries in the daily BehaviorBatch.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FeedbackEvent {
-    /// Task rated (= SATI task_ref).
+    /// Task rated.
     pub conversation_id: [u8; 16],
     /// Agent who gave the feedback.
     pub from_agent: [u8; 32],
     /// Score: -100 to +100.
     pub score: i8,
-    /// Outcome: 0=Negative, 1=Neutral, 2=Positive (SATI-compatible).
+    /// Outcome: 0=Negative, 1=Neutral, 2=Positive.
     pub outcome: u8,
-    /// Role: 0=rated as participant, 1=rated as notary.
-    pub role: u8,
-    /// Slot of FEEDBACK message.
+    /// Unix timestamp (seconds) of FEEDBACK message.
     pub slot: u64,
-    /// keccak256 of SATI FeedbackV1 compressed account address.
-    /// [0u8; 32] if SATI attestation not yet submitted.
-    pub sati_attestation_hash: [u8; 32],
 }
 
 // ============================================================================
 // BehaviorBatch (doc 5, §8.2)
 // ============================================================================
 
-/// Per-epoch self-reported economic record submitted on-chain daily.
+/// Per-epoch self-reported economic record.
 ///
 /// Self-reported arrays are challengeable within CHALLENGE_WINDOW.
 /// Arrays capped at MAX_BATCH_ENTRIES; overflow committed via overflow_data_hash.
 #[derive(Debug, Clone)]
 pub struct BehaviorBatch {
     // --- Identity and epoch bounds ------------------------------------------
-    /// Agent ID = SATI mint address.
+    /// Agent ID (Ed25519 verifying key bytes).
     pub agent_id: [u8; 32],
     /// Zero-based epoch counter (increments each 0x01 day).
     pub epoch_number: u64,
-    /// Solana slot at epoch start.
+    /// Unix timestamp (seconds) at epoch start.
     pub slot_start: u64,
-    /// Solana slot at epoch end.
+    /// Unix timestamp (seconds) at epoch end.
     pub slot_end: u64,
 
     // --- Activity summary ---------------------------------------------------
@@ -92,17 +75,14 @@ pub struct BehaviorBatch {
     pub msg_type_counts: [u32; 16],
     /// Distinct agents interacted with.
     pub unique_counterparties: u32,
-    /// VERDICT received count (tasks completed as participant).
+    /// VERDICT received count (tasks completed).
     pub tasks_completed: u32,
-    /// VERDICT sent count (tasks completed as notary).
-    pub notarizations: u32,
     /// DISPUTE sent or received count.
     pub disputes: u32,
 
     // --- Self-reported economic arrays (challengeable) ----------------------
     pub bid_values: Vec<TypedBid>,
     pub task_selections: Vec<TaskSelection>,
-    pub verifier_ids: Vec<VerifierAssignment>,
     pub feedback_events: Vec<FeedbackEvent>,
 
     // --- Overflow handling --------------------------------------------------
@@ -146,19 +126,11 @@ impl BehaviorBatch {
                 sv("tasks_completed"),
                 Value::Integer(self.tasks_completed.into()),
             ),
-            (
-                sv("notarizations"),
-                Value::Integer(self.notarizations.into()),
-            ),
             (sv("disputes"), Value::Integer(self.disputes.into())),
             (sv("bid_values"), encode_typed_bids(&self.bid_values)),
             (
                 sv("task_selections"),
                 encode_task_selections(&self.task_selections),
-            ),
-            (
-                sv("verifier_ids"),
-                encode_verifier_assignments(&self.verifier_ids),
             ),
             (
                 sv("feedback_events"),
@@ -192,18 +164,16 @@ impl BehaviorBatch {
     pub fn compute_overflow_hash(
         bids: &[TypedBid],
         selections: &[TaskSelection],
-        verifiers: &[VerifierAssignment],
         feedback: &[FeedbackEvent],
     ) -> [u8; 32] {
-        // Serialize all four arrays canonically and hash concatenation.
+        // Serialize all arrays canonically and hash concatenation.
         let mut buf = Vec::new();
 
         let bids_val = encode_typed_bids(bids);
         let sel_val = encode_task_selections(selections);
-        let ver_val = encode_verifier_assignments(verifiers);
         let fb_val = encode_feedback_events(feedback);
 
-        for v in [bids_val, sel_val, ver_val, fb_val] {
+        for v in [bids_val, sel_val, fb_val] {
             // Writing to Vec<u8> is infallible.
             ciborium::into_writer(&v, &mut buf)
                 .unwrap_or_else(|_| unreachable!("CBOR encode to Vec<u8> is infallible"));
@@ -218,21 +188,18 @@ impl BehaviorBatch {
     pub fn apply_overflow_cap(&mut self) {
         let overflows = self.bid_values.len() > MAX_BATCH_ENTRIES
             || self.task_selections.len() > MAX_BATCH_ENTRIES
-            || self.verifier_ids.len() > MAX_BATCH_ENTRIES
             || self.feedback_events.len() > MAX_BATCH_ENTRIES;
 
         if overflows {
             self.overflow_data_hash = Self::compute_overflow_hash(
                 &self.bid_values,
                 &self.task_selections,
-                &self.verifier_ids,
                 &self.feedback_events,
             );
             self.overflow = true;
 
             self.bid_values.truncate(MAX_BATCH_ENTRIES);
             self.task_selections.truncate(MAX_BATCH_ENTRIES);
-            self.verifier_ids.truncate(MAX_BATCH_ENTRIES);
             self.feedback_events.truncate(MAX_BATCH_ENTRIES);
         }
     }
@@ -277,20 +244,6 @@ fn encode_task_selections(sel: &[TaskSelection]) -> Value {
     )
 }
 
-fn encode_verifier_assignments(ver: &[VerifierAssignment]) -> Value {
-    Value::Array(
-        ver.iter()
-            .map(|v| {
-                Value::Array(vec![
-                    Value::Bytes(v.conversation_id.to_vec()),
-                    Value::Bytes(v.verifier_id.to_vec()),
-                    Value::Integer(v.slot.into()),
-                ])
-            })
-            .collect(),
-    )
-}
-
 fn encode_feedback_events(events: &[FeedbackEvent]) -> Value {
     Value::Array(
         events
@@ -301,9 +254,7 @@ fn encode_feedback_events(events: &[FeedbackEvent]) -> Value {
                     Value::Bytes(e.from_agent.to_vec()),
                     Value::Integer((e.score as i64).into()),
                     Value::Integer(e.outcome.into()),
-                    Value::Integer(e.role.into()),
                     Value::Integer(e.slot.into()),
-                    Value::Bytes(e.sati_attestation_hash.to_vec()),
                 ])
             })
             .collect(),
@@ -328,7 +279,6 @@ mod tests {
             msg_type_counts: [0u32; 16],
             unique_counterparties: 2,
             tasks_completed: 1,
-            notarizations: 0,
             disputes: 0,
             bid_values: vec![TypedBid {
                 conversation_id: [2u8; 16],
@@ -337,15 +287,12 @@ mod tests {
                 slot: 1_050,
             }],
             task_selections: vec![],
-            verifier_ids: vec![],
             feedback_events: vec![FeedbackEvent {
                 conversation_id: [2u8; 16],
                 from_agent: [3u8; 32],
                 score: 80,
                 outcome: 2,
-                role: 0,
                 slot: 1_100,
-                sati_attestation_hash: [0u8; 32],
             }],
             overflow: false,
             overflow_data_hash: [0u8; 32],

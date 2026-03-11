@@ -23,7 +23,7 @@ use zerox1_protocol::{
 
 use crate::{
     api::{
-        ApiEvent, ApiState, BatchSnapshot, OutboundRequest, PeerSnapshot, PortfolioEvent,
+        ApiEvent, ApiState, BatchSnapshot, OutboundRequest, PeerSnapshot,
         ReputationSnapshot, SentConfirmation,
     },
     batch::{current_epoch, now_micros, BatchAccumulator},
@@ -32,7 +32,6 @@ use crate::{
     logger::EnvelopeLogger,
     network::{Zx01Behaviour, Zx01BehaviourEvent},
     peer_state::PeerStateMap,
-    push_notary,
     reputation::ReputationTracker,
 };
 
@@ -41,8 +40,14 @@ use crate::{
 //
 // BEACON:          [agent_id(32)][verifying_key(32)][name(utf-8)]
 // PROPOSE/COUNTER: [bid_value(16, LE i128)][opaque agent payload...]
-// NOTARIZE_ASSIGN: [verifier_agent_id(32)][opaque...]
 // ============================================================================
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 const BEACON_VK_OFFSET: usize = 32;
 const BEACON_NAME_OFFSET: usize = 64;
@@ -74,7 +79,6 @@ pub struct Zx01Node {
     api: ApiState,
 
     nonce: u64,
-    current_slot: u64,
     current_epoch: u64,
     conversations: HashMap<[u8; 16], PeerId>,
     conversation_lru: VecDeque<[u8; 16]>,
@@ -92,7 +96,6 @@ pub struct Zx01Node {
     http_client: reqwest::Client,
     /// Per-peer message rate limiter: PeerId → (count_in_window, window_start).
     rate_limiter: std::collections::HashMap<libp2p::PeerId, (u32, std::time::Instant)>,
-    /// Agents known to offer notary services (populated from NOTARIZE_BID broadcasts).
     /// Bootstrap peer multiaddrs — used to redial when the node loses all connections.
     bootstrap_peers: Vec<libp2p::Multiaddr>,
     /// Broadcasts queued when gossipsub had no mesh peers (InsufficientPeers).
@@ -131,10 +134,6 @@ impl Zx01Node {
             config.skill_workspace.clone(),
         );
 
-        // Load portfolio history from disk
-        let portfolio_path = config.log_dir.join("portfolio_history.json");
-        let _ = api.load_portfolio_history(portfolio_path).await;
-
         let batch = BatchAccumulator::new(epoch, 0);
         let logger = EnvelopeLogger::new(log_dir, epoch);
 
@@ -147,7 +146,6 @@ impl Zx01Node {
             batch,
             api,
             nonce: 0,
-            current_slot: 0,
             current_epoch: epoch,
             conversations: HashMap::new(),
             conversation_lru: VecDeque::new(),
@@ -255,69 +253,13 @@ impl Zx01Node {
                 "msg_type":     "ADVERTISE",
                 "sender":       hex::encode(self.identity.agent_id),
                 "capabilities": [],
-                "slot":         self.current_slot,
+                "slot":         now_secs(),
                 "geo": {
                     "country": country,
                     "city":    self.config.geo_city.clone(),
                 }
             }));
             tracing::info!("Geo registered: country={country}");
-        }
-
-        // ── FCM registration (phone-as-node) ─────────────────────────────────
-        // If a Firebase device token is configured, register it with the
-        // aggregator and pull any messages that arrived while sleeping.
-        if let (Some(ref fcm_token), Some(ref agg_url)) =
-            (self.config.fcm_token.clone(), self.aggregator_url.clone())
-        {
-            let agent_id_hex = hex::encode(self.identity.agent_id);
-            // Register token.
-            if let Err(e) = push_notary::register_fcm_token(
-                agg_url,
-                &agent_id_hex,
-                fcm_token,
-                &self.identity.signing_key,
-                &self.http_client,
-            )
-            .await
-            {
-                tracing::warn!("FCM token registration failed: {e}");
-            } else {
-                tracing::info!("FCM token registered with aggregator.");
-            }
-            // Mark this node as awake.
-            if let Err(e) = push_notary::set_sleep_mode(
-                agg_url,
-                &agent_id_hex,
-                false,
-                &self.identity.signing_key,
-                &self.http_client,
-            )
-            .await
-            {
-                tracing::warn!("FCM wake notification failed: {e}");
-            }
-            // Pull any messages held while sleeping.
-            match push_notary::pull_pending_messages(
-                agg_url,
-                &agent_id_hex,
-                &self.identity.signing_key,
-                &self.http_client,
-            )
-            .await
-            {
-                Ok::<Vec<push_notary::PendingMessage>, _>(msgs) if !msgs.is_empty() => {
-                    tracing::info!(
-                        "{} pending message(s) retrieved from aggregator while sleeping.",
-                        msgs.len()
-                    );
-                    for msg in &msgs {
-                        tracing::info!("Pending [{}] from {} — {}", msg.msg_type, msg.from, msg.id);
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("Failed to pull pending messages: {e}"),
-            }
         }
 
         let mut beacon_timer = tokio::time::interval(Duration::from_secs(30));
@@ -337,7 +279,7 @@ impl Zx01Node {
                 }
                 Some(env) = self.hosted_outbound_rx.recv() => {
                     // Record it in the batch so it's not bypassing the epoch logging!
-                    self.batch.record_message(env.msg_type, env.sender, self.current_slot);
+                    self.batch.record_message(env.msg_type, env.sender, now_secs());
                     if let Err(e) = self.logger.log(&env) {
                         tracing::warn!("Logger error on hosted outbound: {e}");
                     }
@@ -582,7 +524,7 @@ impl Zx01Node {
                                 "agent_id": hex::encode(agent_id),
                                 "region":   region,
                                 "rtt_ms":   rtt_ms,
-                                "slot":     self.current_slot,
+                                "slot":     now_secs(),
                             }));
                             self.last_ping_push.insert(peer, now);
                             tracing::debug!(
@@ -677,14 +619,14 @@ impl Zx01Node {
         self.api.send_event(ApiEvent::Envelope {
             sender: hex::encode(env.sender),
             msg_type: format!("{:?}", env.msg_type),
-            slot: self.current_slot,
+            slot: now_secs(),
         });
 
         // Push to agent inbox.
-        self.api.push_inbound(&env, self.current_slot);
+        self.api.push_inbound(&env);
 
         self.batch
-            .record_message(env.msg_type, env.sender, self.current_slot);
+            .record_message(env.msg_type, env.sender, now_secs());
 
         // Route.
         if topic_str == TOPIC_REPUTATION && env.msg_type == MsgType::Feedback {
@@ -717,7 +659,7 @@ impl Zx01Node {
                                     "msg_type":     "ADVERTISE",
                                     "sender":       hex::encode(env.sender),
                                     "capabilities": caps,
-                                    "slot":         self.current_slot,
+                                    "slot":         now_secs(),
                                 });
                                 if let Some(geo) = val.get("geo") {
                                     push["geo"] = geo.clone();
@@ -800,11 +742,11 @@ impl Zx01Node {
         }
 
         self.batch
-            .record_message(env.msg_type, env.sender, self.current_slot);
+            .record_message(env.msg_type, env.sender, now_secs());
         self.track_conversation_peer(env.conversation_id, peer_id);
 
         // Push to agent inbox.
-        self.api.push_inbound(&env, self.current_slot);
+        self.api.push_inbound(&env);
 
         match env.msg_type {
             MsgType::Propose => {
@@ -818,7 +760,7 @@ impl Zx01Node {
                     conversation_id: env.conversation_id,
                     counterparty: env.sender,
                     bid_value,
-                    slot: self.current_slot,
+                    slot: now_secs(),
                 });
             }
             MsgType::Counter => {
@@ -833,7 +775,7 @@ impl Zx01Node {
                     conversation_id: env.conversation_id,
                     counterparty: env.sender,
                     bid_value,
-                    slot: self.current_slot,
+                    slot: now_secs(),
                 });
                 tracing::info!(
                     "COUNTER from {} for conversation {} (bid={})",
@@ -847,14 +789,14 @@ impl Zx01Node {
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
                     "bid_value":       bid_value,
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Accept => {
                 self.batch.record_accept(TaskSelection {
                     conversation_id: env.conversation_id,
                     counterparty: env.sender,
-                    slot: self.current_slot,
+                    slot: now_secs(),
                 });
             }
             MsgType::Reject => {
@@ -868,7 +810,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Deliver => {
@@ -882,7 +824,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Dispute => {
@@ -898,7 +840,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "disputed_agent":  hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             // ── Collaboration messages (0x1_) ─────────────────────────────────
@@ -913,7 +855,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Ack => {
@@ -927,7 +869,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Clarify => {
@@ -941,7 +883,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Report => {
@@ -955,7 +897,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Approve => {
@@ -969,7 +911,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::TaskCancel => {
@@ -983,7 +925,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Escalate => {
@@ -997,7 +939,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             MsgType::Sync => {
@@ -1011,7 +953,7 @@ impl Zx01Node {
                     "sender":          hex::encode(env.sender),
                     "recipient":       hex::encode(env.recipient),
                     "conversation_id": hex::encode(env.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                 }));
             }
             _ => {}
@@ -1035,7 +977,7 @@ impl Zx01Node {
                 self.reputation.apply_feedback(
                     fb.target_agent,
                     fb.score,
-                    fb.role,
+                    0,
                     self.current_epoch,
                 );
 
@@ -1053,9 +995,8 @@ impl Zx01Node {
                     "score":           fb.score,
                     "outcome":         fb.outcome,
                     "is_dispute":      fb.is_dispute,
-                    "role":            fb.role,
                     "conversation_id": hex::encode(fb.conversation_id),
-                    "slot":            self.current_slot,
+                    "slot":            now_secs(),
                     "raw_b64":         raw_b64,
                 }));
 
@@ -1065,7 +1006,6 @@ impl Zx01Node {
                         agent_id: hex::encode(fb.target_agent),
                         reliability: rv.reliability_score,
                         cooperation: rv.cooperation_index,
-                        notary_accuracy: rv.notary_accuracy,
                         total_tasks: rv.total_tasks,
                         total_disputes: rv.total_disputes,
                         last_active_epoch: rv.last_active_epoch,
@@ -1085,30 +1025,9 @@ impl Zx01Node {
                         from_agent: env.sender,
                         score: fb.score,
                         outcome: fb.outcome,
-                        role: fb.role,
-                        slot: self.current_slot,
-                        sati_attestation_hash: [0u8; 32],
+                        slot: now_secs(),
                     });
 
-                    // Record bounty in portfolio if positive score
-                    if fb.score > 0 {
-                        let api = self.api.clone();
-                        let from = env.sender;
-                        let cid = hex::encode(fb.conversation_id);
-                        let score = fb.score;
-                        tokio::spawn(async move {
-                            api.record_portfolio_event(PortfolioEvent::Bounty {
-                                amount_usdc: score as f64 / 10.0, // 10 score = $1.00
-                                from_agent: hex::encode(from),
-                                conversation_id: cid,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs(),
-                            })
-                            .await;
-                        });
-                    }
                 }
             }
             Err(e) => tracing::debug!("FEEDBACK payload parse failed: {e}"),
@@ -1177,7 +1096,7 @@ impl Zx01Node {
                     "msg_type": "BEACON",
                     "sender":   hex::encode(env.sender),
                     "name":     safe,
-                    "slot":     self.current_slot,
+                    "slot":     now_secs(),
                 }));
             }
         }
@@ -1199,7 +1118,7 @@ impl Zx01Node {
             msg_type,
             self.identity.agent_id,
             recipient,
-            self.current_slot,
+            now_secs(),
             self.nonce,
             conversation_id,
             payload,
@@ -1324,7 +1243,7 @@ impl Zx01Node {
                     tracing::warn!("Logger error on outbound: {e}");
                 }
                 self.batch
-                    .record_message(req.msg_type, self.identity.agent_id, self.current_slot);
+                    .record_message(req.msg_type, self.identity.agent_id, now_secs());
                 tracing::debug!("Sent {} nonce={nonce}", req.msg_type);
             }
             Err(e) => tracing::warn!("Outbound send failed: {e}"),
@@ -1357,7 +1276,7 @@ impl Zx01Node {
                     "msg_type": "BEACON",
                     "sender":   hex::encode(self.identity.agent_id),
                     "name":     self.config.agent_name,
-                    "slot":     self.current_slot,
+                    "slot":     now_secs(),
                 }));
             }
             Err(e) if e.to_string().contains("InsufficientPeers") => {
@@ -1402,9 +1321,9 @@ impl Zx01Node {
             }
         };
 
-        let (batch, message_slots) =
+        let batch =
             self.batch
-                .finalize(self.identity.agent_id, self.current_slot, &leaves);
+                .finalize(self.identity.agent_id, now_secs(), &leaves);
         let epoch = self.current_epoch;
 
         let batch_hash_hex = match batch.batch_hash() {
@@ -1437,53 +1356,8 @@ impl Zx01Node {
             batch_hash: batch_hash_hex,
         });
 
-        // GAP-04: Compute verifier ID histogram and push to aggregator
-        let mut verifier_histogram: HashMap<String, u32> = HashMap::new();
-        for assignment in &batch.verifier_ids {
-            let vid = hex::encode(assignment.verifier_id);
-            *verifier_histogram.entry(vid).or_insert(0) += 1;
-        }
-
-        if !verifier_histogram.is_empty() {
-            self.push_to_aggregator(serde_json::json!({
-                "msg_type":  "VERIFIER_HISTOGRAM",
-                "agent_id":  hex::encode(batch.agent_id),
-                "epoch":     batch.epoch_number,
-                "histogram": verifier_histogram,
-            }));
-        }
-
-        // Compute entropy vector and push to aggregator.
-        let ev = zerox1_protocol::entropy::compute(
-            &batch,
-            &message_slots,
-            &zerox1_protocol::entropy::EntropyParams::default(),
-        );
-        tracing::info!(
-            "Epoch {epoch} entropy: ht={:?} hb={:?} hs={:?} hv={:?} anomaly={:.4}",
-            ev.ht,
-            ev.hb,
-            ev.hs,
-            ev.hv,
-            ev.anomaly,
-        );
-        self.push_to_aggregator(serde_json::json!({
-            "msg_type":  "ENTROPY",
-            "agent_id":  hex::encode(ev.agent_id),
-            "epoch":     ev.epoch,
-            "ht":        ev.ht,
-            "hb":        ev.hb,
-            "hs":        ev.hs,
-            "hv":        ev.hv,
-            "anomaly":   ev.anomaly,
-            "n_ht":      ev.n_ht,
-            "n_hb":      ev.n_hb,
-            "n_hs":      ev.n_hs,
-            "n_hv":      ev.n_hv,
-        }));
-
         self.current_epoch = new_epoch;
-        self.batch = BatchAccumulator::new(new_epoch, self.current_slot);
+        self.batch = BatchAccumulator::new(new_epoch, now_secs());
         self.reputation.advance_epoch(new_epoch);
     }
 

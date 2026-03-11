@@ -17,7 +17,7 @@ pub const BROADCAST_RECIPIENT: [u8; 32] = [0u8; 32];
 /// Fields are ordered exactly as in the spec. CBOR encoding preserves this order.
 /// All integers are big-endian in the wire format.
 ///
-/// `sender` is the agent's SATI mint address (32 bytes / Pubkey).
+/// `sender` is the agent's Ed25519 verifying key (32 bytes).
 /// `signature` covers all fields preceding it via `signing_bytes()`.
 #[derive(Debug, Clone)]
 pub struct Envelope {
@@ -25,13 +25,13 @@ pub struct Envelope {
     pub version: u8,
     /// Message type (see MsgType enum).
     pub msg_type: MsgType,
-    /// Sender = SATI mint address (32 bytes).
+    /// Sender Ed25519 verifying key (32 bytes).
     pub sender: [u8; 32],
-    /// Recipient = SATI mint address, or BROADCAST_RECIPIENT for pubsub.
+    /// Recipient Ed25519 verifying key, or BROADCAST_RECIPIENT for pubsub.
     pub recipient: [u8; 32],
     /// Unix microseconds (agent wall clock).
     pub timestamp: u64,
-    /// Solana slot at time of sending.
+    /// Unix seconds at time of sending (wall clock reference).
     pub block_ref: u64,
     /// Monotonic per-sender nonce for replay protection.
     pub nonce: u64,
@@ -185,7 +185,7 @@ impl Envelope {
     /// Validate all envelope invariants (doc 5, §5.5).
     ///
     /// `last_nonce`     — last seen nonce from this sender (0 if unknown)
-    /// `verifying_key`  — Ed25519 key for the sender (from SATI or local cache)
+    /// `verifying_key`  — Ed25519 verifying key for the sender
     /// `now_micros`     — current wall-clock time in microseconds
     pub fn validate(
         &self,
@@ -200,8 +200,7 @@ impl Envelope {
 
         // Rule 2: msg_type already validated on decode (MsgType::from_u16)
 
-        // Rule 3: sender registration is checked externally (SATI client)
-        // before calling validate().
+        // Rule 3: sender registration is checked externally before calling validate().
 
         // Rule 4: signature
         let sig = Signature::from_bytes(&self.signature);

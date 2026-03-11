@@ -38,6 +38,6 @@ pub enum ProtocolError {
     #[error("CBOR decode error: {0}")]
     CborDecode(String),
 
-    #[error("sender not registered in SATI")]
+    #[error("sender not registered")]
     SenderNotRegistered,
 }

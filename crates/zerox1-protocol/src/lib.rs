@@ -1,6 +1,5 @@
 pub mod batch;
 pub mod constants;
-pub mod entropy;
 pub mod envelope;
 pub mod error;
 pub mod hash;

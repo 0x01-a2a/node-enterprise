@@ -25,11 +25,11 @@ pub struct PeerEntry {
 /// Thread-local in-memory peer state map.
 pub struct PeerStateMap {
     by_agent_id: HashMap<[u8; 32], PeerEntry>,
-    /// Durable replay floor for SATI-confirmed agents.
+    /// Durable replay floor for known agents.
     /// Preserved across in-memory `by_agent_id` evictions so nonce replay
     /// protection does not reset under churn.
     confirmed_nonce_floor: HashMap<[u8; 32], u64>,
-    /// Reverse lookup: libp2p PeerId → 0x01 agent_id (SATI mint).
+    /// Reverse lookup: libp2p PeerId → 0x01 agent_id.
     peer_to_agent: HashMap<PeerId, [u8; 32]>,
     /// Keys received from the `identify` protocol before the peer has sent a
     /// BEACON.  Stored here temporarily and applied once register_peer() is

@@ -6,7 +6,6 @@ mod logger;
 mod network;
 mod node;
 mod peer_state;
-mod push_notary;
 mod reputation;
 
 use clap::Parser;

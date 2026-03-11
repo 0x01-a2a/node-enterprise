@@ -223,7 +223,6 @@ pub fn build_swarm(
     // Subscribe to all 0x01 pubsub topics.
     for topic_str in [
         zerox1_protocol::constants::TOPIC_BROADCAST,
-        zerox1_protocol::constants::TOPIC_NOTARY,
         zerox1_protocol::constants::TOPIC_REPUTATION,
     ] {
         swarm

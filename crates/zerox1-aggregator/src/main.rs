@@ -36,14 +36,6 @@ struct Config {
     db_path: Option<std::path::PathBuf>,
 
 
-    /// Firebase Cloud Messaging server key for sending push notifications to
-    /// sleeping phone nodes. Obtain from the Firebase project console under
-    /// Project Settings → Cloud Messaging → Server key.
-    /// When absent, the FCM push feature is disabled (token registration and
-    /// sleep-state tracking still work, but no pushes are sent).
-    #[arg(long, env = "FCM_SERVER_KEY")]
-    fcm_server_key: Option<String>,
-
     /// Shared secret for POST /hosting/register.
     /// Host nodes must include `Authorization: Bearer <secret>` in their
     /// heartbeat requests. When absent, the endpoint is unauthenticated
@@ -101,13 +93,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    if config.fcm_server_key.is_none() {
-        tracing::info!(
-            "No --fcm-server-key set. FCM push notifications are disabled. \
-             Token registration and sleep-state tracking still work."
-        );
-    }
-
     if config.hosting_secret.is_none() {
         tracing::warn!(
             "No --hosting-secret set. POST /hosting/register is unauthenticated. \
@@ -117,8 +102,6 @@ async fn main() -> anyhow::Result<()> {
 
     let (activity_tx, _) = broadcast::channel::<ActivityEvent>(512);
 
-    let http_client = reqwest::Client::new();
-
     let max_blob_size = config.max_blob_size;
 
     let state = AppState {
@@ -127,8 +110,6 @@ async fn main() -> anyhow::Result<()> {
         hosting_secret: config.hosting_secret,
         blob_dir: config.blob_dir,
         max_blob_size,
-        fcm_server_key: config.fcm_server_key,
-        http_client,
         activity_tx,
         api_keys: config.api_keys,
     };
@@ -140,25 +121,6 @@ async fn main() -> anyhow::Result<()> {
         // Internal push endpoints — use their own secrets
         .route("/ingest/envelope", post(api::ingest_envelope))
         .route("/hosting/register", post(api::post_hosting_register))
-        // FCM registration & push-receive (agent-authenticated via Ed25519)
-        .route("/fcm/register", post(api::fcm_register))
-        .route("/fcm/sleep", post(api::fcm_sleep))
-        .route(
-            "/agents/{agent_id}/pending",
-            get(api::get_pending).post(api::post_pending),
-        )
-        // Agent-authenticated ownership endpoints
-        .route(
-            "/agents/{agent_id}/propose-owner",
-            post(api::post_propose_owner),
-        )
-        .route(
-            "/agents/{agent_id}/claim-owner",
-            post(api::post_claim_owner),
-        )
-        // Public ownership lookup — mobile app needs this without an API key
-        .route("/agents/{agent_id}/owner", get(api::get_agent_owner))
-        .route("/agents/by-owner/{wallet}", get(api::get_agents_by_owner))
         // High-level public stats for the landing page
         .route("/stats/network", get(api::get_network_stats))
         .route("/agents", get(api::get_agents))
@@ -180,32 +142,12 @@ async fn main() -> anyhow::Result<()> {
     let gated_routes = Router::new()
         .route("/reputation/{agent_id}", get(api::get_reputation))
         .route("/leaderboard", get(api::get_leaderboard))
-        .route("/leaderboard/anomaly", get(api::get_anomaly_leaderboard))
         .route("/interactions", get(api::get_interactions))
         .route("/stats/timeseries", get(api::get_timeseries))
-        .route("/entropy/{agent_id}", get(api::get_entropy))
-        .route("/entropy/{agent_id}/history", get(api::get_entropy_history))
-        .route("/entropy/{agent_id}/rolling", get(api::get_rolling_entropy))
-        .route(
-            "/leaderboard/verifier-concentration",
-            get(api::get_verifier_concentration),
-        )
-        .route(
-            "/leaderboard/ownership-clusters",
-            get(api::get_ownership_clusters),
-        )
-        .route("/params/calibrated", get(api::get_calibrated_params))
-        .route("/system/sri", get(api::get_sri_status))
-        .route(
-            "/epochs/{agent_id}/{epoch}/envelopes",
-            get(api::get_epoch_envelopes),
-        )
         .route("/agents/search", get(api::search_agents))
         .route("/agents/search/name", get(api::search_agents_by_name))
         .route("/interactions/by/{agent_id}", get(api::get_interactions_by))
-        .route("/disputes/{agent_id}", get(api::get_disputes))
         .route("/registry", get(api::get_registry))
-        .route("/agents/{agent_id}/sleeping", get(api::get_sleep_status))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             api::api_key_middleware,

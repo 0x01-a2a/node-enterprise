@@ -16,10 +16,7 @@ pub struct ReputationVector {
     pub reliability_score: i64,
     /// Cooperation / counterparty satisfaction.
     pub cooperation_index: i64,
-    /// Accuracy of notary judgments.
-    pub notary_accuracy: i64,
     pub total_tasks: u32,
-    pub total_notarized: u32,
     pub total_disputes: u32,
     pub last_active_epoch: u64,
 }
@@ -48,8 +45,7 @@ impl ReputationTracker {
     }
 
     /// Apply a FEEDBACK message to the gossip scores.
-    /// `role` = 0 (participant), 1 (notary).
-    pub fn apply_feedback(&mut self, target: [u8; 32], score: i8, role: u8, epoch: u64) {
+    pub fn apply_feedback(&mut self, target: [u8; 32], score: i8, _role: u8, epoch: u64) {
         let entry = self
             .scores
             .entry(target)
@@ -62,17 +58,10 @@ impl ReputationTracker {
 
         // Running average: new_score = (old × (n-1) + delta) / n
         let delta = score as i64 * 1_000; // fixed-precision ×1000
-
-        if role == 0 {
-            let n = (entry.total_tasks + 1) as i64;
-            entry.reliability_score = (entry.reliability_score * (n - 1) + delta) / n;
-            entry.cooperation_index = (entry.cooperation_index * (n - 1) + delta) / n;
-            entry.total_tasks += 1;
-        } else {
-            let n = (entry.total_notarized + 1) as i64;
-            entry.notary_accuracy = (entry.notary_accuracy * (n - 1) + delta) / n;
-            entry.total_notarized += 1;
-        }
+        let n = (entry.total_tasks + 1) as i64;
+        entry.reliability_score = (entry.reliability_score * (n - 1) + delta) / n;
+        entry.cooperation_index = (entry.cooperation_index * (n - 1) + delta) / n;
+        entry.total_tasks += 1;
     }
 
     pub fn record_dispute(&mut self, agent_id: [u8; 32]) {
@@ -112,9 +101,6 @@ impl ReputationTracker {
                         * REPUTATION_DECAY_NUMERATOR as i64
                         / REPUTATION_DECAY_DENOMINATOR as i64;
                     entry.cooperation_index = entry.cooperation_index
-                        * REPUTATION_DECAY_NUMERATOR as i64
-                        / REPUTATION_DECAY_DENOMINATOR as i64;
-                    entry.notary_accuracy = entry.notary_accuracy
                         * REPUTATION_DECAY_NUMERATOR as i64
                         / REPUTATION_DECAY_DENOMINATOR as i64;
                 }
@@ -174,20 +160,6 @@ mod tests {
         tracker.apply_feedback(agent(3), 100, 0, 1);
         tracker.apply_feedback(agent(3), -100, 0, 2);
         let v = tracker.get(&agent(3)).unwrap();
-        assert_eq!(v.reliability_score, 0);
-    }
-
-    // --- apply_feedback (role 1 = notary) ---
-
-    #[test]
-    fn notary_feedback_updates_notary_accuracy_not_tasks() {
-        let mut tracker = ReputationTracker::new();
-        tracker.apply_feedback(agent(4), 80, 1, 1);
-        let v = tracker.get(&agent(4)).unwrap();
-        assert_eq!(v.notary_accuracy, 80_000);
-        assert_eq!(v.total_notarized, 1);
-        assert_eq!(v.total_tasks, 0);
-        // reliability and cooperation unchanged
         assert_eq!(v.reliability_score, 0);
     }
 
